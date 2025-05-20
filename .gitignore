@@ -1,0 +1,7 @@
+__pycache__
+out.nosync
+*.tex
+*.env
+.vscode
+.DS_Store
+.gitmessage
