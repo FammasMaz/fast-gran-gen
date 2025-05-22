@@ -48,7 +48,9 @@ def get_args():
         "--transforms", type=str2bool, default=False
     )  # TODO:currently not used, but can be used to apply random transformations
     parser.add_argument("--mixed_precision", type=str2bool, default=True)  # use mixed precision training
-    parser.add_argument("--small", type=str2bool, default=True)  # use smaller dataset for testing/dataset debugging
+    parser.add_argument(
+        "--small", type=str2bool, default=False
+    )  # use smaller dataset for testing/dataset debugging only, else false
     parser.add_argument(
         "--patience", type=int, default=500
     )  # number of epochs to wait before stopping training if no improvement, currently not used (arbitarily high)
@@ -56,7 +58,7 @@ def get_args():
     parser.add_argument(
         "--with_metadata", type=str2bool, default=False
     )  # TODO: not used, but can be used to save metadata
-    parser.add_argument("--scheduler", type=str, default="squaredcos_cap_v2")  # noise scheduling function
+    parser.add_argument("--scheduler", type=str, default="vi")  # noise scheduling function
     parser.add_argument(
         "--patched", action="store_true"
     )  # TODO: used for training on huge datasamples and not on patches, code ommitted for brevity and non-relevance
@@ -116,9 +118,15 @@ def get_args():
     parser.add_argument(
         "--central_block_max_ratio",
         type=float,
-        default=0.7,
+        default=0.8,
         help="Maximum ratio of the central block size to the total dimension.",
     )  # only used if mask_type is central_large_block. Default value was 0.7. Higher values were not yet tested.
+    parser.add_argument(
+        "--central_block_min_ratio",
+        type=float,
+        default=0.7,
+        help="Minimum ratio of the central block size to the total dimension.",
+    )
     parser.add_argument(
         "--edge_type",
         type=str,
@@ -157,12 +165,6 @@ def get_args():
     # if using multiblock set min and max blocks
     parser.add_argument("--min_blocks", type=int, default=8, help="Minimum number of blocks to use for inpainting.")
     parser.add_argument("--max_blocks", type=int, default=15, help="Maximum number of blocks to use for inpainting.")
-    parser.add_argument(
-        "--central_block_min_ratio",
-        type=float,
-        default=0.4,
-        help="Minimum ratio of the central block size to the total dimension.",
-    )
 
     #### Logger configuration ####
 
