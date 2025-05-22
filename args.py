@@ -58,7 +58,7 @@ def get_args():
     parser.add_argument(
         "--with_metadata", type=str2bool, default=False
     )  # TODO: not used, but can be used to save metadata
-    parser.add_argument("--scheduler", type=str, default="vi")  # noise scheduling function
+    parser.add_argument("--scheduler", type=str, default="squaredcos_cap_v2")  # noise scheduling function
     parser.add_argument(
         "--patched", action="store_true"
     )  # TODO: used for training on huge datasamples and not on patches, code ommitted for brevity and non-relevance
