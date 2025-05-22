@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained diffusion model directory")
     parser.add_argument("--output_dir", type=str, default="cli_output", help="Output directory for saving VTI files")
     parser.add_argument("--scheduler_type", choices=["ddpm", "ddim"], default="ddpm", help="Choose sampling scheduler")
-    parser.add_argument("--inference_steps", type=int, default=80, help="Number of inference steps")
+    parser.add_argument("--inference_steps", type=int, default=100, help="Number of inference steps")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation (default: random)")
     parser.add_argument(
         "--n_blocks",
@@ -74,7 +74,7 @@ def main():
     parser.add_argument(
         "--mask_type",
         type=str,
-        default="random_block",
+        default="central_large_block",
         choices=[
             "random_block",
             "multi_block",
@@ -107,13 +107,13 @@ def main():
     parser.add_argument(
         "--central_block_min_ratio",
         type=float,
-        default=0.7,
+        default=0.3,
         help="Minimum ratio of the central block size to the total dimension (for central_large_block).",
     )
     parser.add_argument(
         "--central_block_max_ratio",
         type=float,
-        default=0.8,
+        default=0.7,
         help="Maximum ratio of the central block size to the total dimension (for central_large_block).",
     )
     parser.add_argument(
