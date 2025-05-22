@@ -61,7 +61,7 @@ def main():
         mapping_cache_dir=args.cache_dir,
         percentage=args.percentage,
         sdf=args.use_sdf,
-        interpolate=False,
+        interpol=False,  # interpolation is not used
         sdf_scale=args.sdf_scale,
     )
 
