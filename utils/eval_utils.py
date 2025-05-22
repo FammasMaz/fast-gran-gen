@@ -233,9 +233,24 @@ def generate_single_volume(
     image_shape = (batch_size, C, D, H, W)
 
     mask = None
-    if hasattr(args, "mask_type") and args.mask_type is not None and args.mask_type != "none":  # Added check for none
-        mask_generator = MaskGenerator3D(args, num_channels=1)  # Pass the full args object
-        mask = mask_generator([batch_size, 1, D, H, W]).to(device)
+    model_is_inpainting = hasattr(unet.config, "inpainting_mode") and unet.config.inpainting_mode
+
+    if model_is_inpainting:
+        if hasattr(args, "mask_type") and args.mask_type is not None and args.mask_type != "none":
+            logger.info(f"Model is inpainting. Using mask_type: {args.mask_type} for single volume generation.")
+            mask_generator = MaskGenerator3D(args, num_channels=1)
+            mask = mask_generator([batch_size, 1, D, H, W]).to(device)
+        else:
+            logger.warning(
+                f"Model is inpainting, but no valid mask_type specified in args (mask_type: {getattr(args, 'mask_type', 'Not Set')}). "
+                f"Proceeding without mask. This might lead to unexpected behavior or errors if the inpainting model strictly requires mask channels."
+            )
+    else:  # Model is NOT inpainting (standard/unconditional)
+        if hasattr(args, "mask_type") and args.mask_type is not None and args.mask_type != "none":
+            logger.warning(
+                f"Model is NOT inpainting (unconditional). Ignoring user-specified or default args.mask_type ('{args.mask_type}') for single volume generation, as unconditional models do not use masks."
+            )
+        # mask remains None, as intended for an unconditional model
 
     # process the batch, applying retry logic per volume
     volumes_np_0_1 = []
