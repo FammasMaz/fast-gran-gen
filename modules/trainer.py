@@ -1550,4 +1550,93 @@ class MaskGenerator3D:
                         for idx in slice_indices:
                             mask[b, :, :, :, idx] = 1
 
+        elif self.mask_type == "mixed_edge_central":
+            # Mixed training for edge-to-edge inpainting: combines central blocks with edge masks
+            # This helps the model learn both central reconstruction and edge inpainting patterns
+
+            for b in range(B):
+                # 70% chance for central block, 30% chance for edge mask
+                # This ratio can be adjusted based on your needs
+                use_central = torch.rand(1).item() > 0.3
+
+                if use_central:
+                    # Apply central_large_block logic
+                    min_ratio = getattr(self.args, "central_block_min_ratio", 0.4)
+                    max_ratio = getattr(self.args, "central_block_max_ratio", 0.7)
+
+                    # Ensure min_ratio is less than max_ratio
+                    if min_ratio >= max_ratio:
+                        min_ratio = max_ratio - 0.1
+                        if min_ratio < 0.1:
+                            min_ratio = 0.1
+
+                    # Random block dimensions as a ratio of the full dimension
+                    block_d_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+                    block_h_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+                    block_w_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+
+                    block_d = max(1, int(block_d_ratio * D))
+                    block_h = max(1, int(block_h_ratio * H))
+                    block_w = max(1, int(block_w_ratio * W))
+
+                    # Calculate start position to center the block, with slight jitter
+                    jitter_factor = getattr(self.args, "central_block_jitter_factor", 0.1)
+
+                    max_offset_d = int(jitter_factor * (D - block_d)) if (D - block_d) > 0 else 0
+                    max_offset_h = int(jitter_factor * (H - block_h)) if (H - block_h) > 0 else 0
+                    max_offset_w = int(jitter_factor * (W - block_w)) if (W - block_w) > 0 else 0
+
+                    offset_d = torch.randint(-max_offset_d, max_offset_d + 1, (1,)).item() if max_offset_d > 0 else 0
+                    offset_h = torch.randint(-max_offset_h, max_offset_h + 1, (1,)).item() if max_offset_h > 0 else 0
+                    offset_w = torch.randint(-max_offset_w, max_offset_w + 1, (1,)).item() if max_offset_w > 0 else 0
+
+                    # Ideal start for centered block
+                    center_start_d = (D - block_d) // 2
+                    center_start_h = (H - block_h) // 2
+                    center_start_w = (W - block_w) // 2
+
+                    # Apply jitter and ensure it stays within bounds
+                    start_d = max(0, min(D - block_d, center_start_d + offset_d))
+                    start_h = max(0, min(H - block_h, center_start_h + offset_h))
+                    start_w = max(0, min(W - block_w, center_start_w + offset_w))
+
+                    mask[
+                        b, :, start_d : start_d + block_d, start_h : start_h + block_h, start_w : start_w + block_w
+                    ] = 1
+
+                else:
+                    # Apply edge mask logic with variable edge selection and width
+                    edge_types = ["right", "left", "top", "bottom", "front", "back"]
+                    selected_edge = edge_types[torch.randint(0, len(edge_types), (1,)).item()]
+
+                    # Use edge_width from args if available, otherwise use random width
+                    if hasattr(self.args, "edge_width") and self.args.edge_width is not None:
+                        base_edge_width = self.args.edge_width
+                    else:
+                        base_edge_width = 0.15  # Default 15%
+
+                    # Add some randomness to edge width (±50% variation)
+                    edge_width_variation = 0.5 + torch.rand(1).item()  # 0.5 to 1.5 multiplier
+                    edge_width = base_edge_width * edge_width_variation
+                    edge_width = min(0.4, max(0.05, edge_width))  # Clamp between 5% and 40%
+
+                    # Calculate actual edge widths for each dimension
+                    d_width = int(edge_width * D)
+                    h_width = int(edge_width * H)
+                    w_width = int(edge_width * W)
+
+                    # Apply edge mask based on selected edge
+                    if selected_edge == "right":
+                        mask[b, :, :, :, W - w_width :] = 1
+                    elif selected_edge == "left":
+                        mask[b, :, :, :, :w_width] = 1
+                    elif selected_edge == "top":
+                        mask[b, :, :, :h_width, :] = 1
+                    elif selected_edge == "bottom":
+                        mask[b, :, :, H - h_width :, :] = 1
+                    elif selected_edge == "front":
+                        mask[b, :, :d_width, :, :] = 1
+                    elif selected_edge == "back":
+                        mask[b, :, D - d_width :, :, :] = 1
+
         return mask

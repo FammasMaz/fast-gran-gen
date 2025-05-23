@@ -112,8 +112,9 @@ def get_args():
             "edge_mask",
             "middle_mask",
             "central_large_block",
+            "mixed_edge_central",
         ],
-        help="Type of mask to use for inpainting. Central large block is the default used in NeurIPS paper.",
+        help="Type of mask to use for inpainting. Central large block is the default used in NeurIPS paper. mixed_edge_central combines central blocks with edge masks for better junction inpainting.",
     )
     parser.add_argument(
         "--central_block_max_ratio",
