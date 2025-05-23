@@ -85,6 +85,7 @@ def main():
             "middle_mask",
             "central_large_block",
             "mixed_edge_central",
+            "gap_filling_compatible",
         ],
         help="Type of mask to use for inpainting mode (only used with inpainting models)",
     )

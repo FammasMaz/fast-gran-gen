@@ -1639,4 +1639,83 @@ class MaskGenerator3D:
                     elif selected_edge == "back":
                         mask[b, :, D - d_width :, :, :] = 1
 
+        elif self.mask_type == "gap_filling_compatible":
+            # Specialized mask type for gap-filling: creates thin strips and other gap-like patterns
+            # This helps the model learn to fill narrow gaps like those in gap-filling evaluation
+
+            for b in range(B):
+                # 60% chance for thin strips (gap-like), 40% chance for central blocks
+                use_strips = torch.rand(1).item() > 0.4
+
+                if use_strips:
+                    # Create thin strip masks (similar to gap-filling)
+                    strip_type = torch.randint(0, 3, (1,)).item()  # 0=depth, 1=height, 2=width
+
+                    if strip_type == 0:  # Depth strips (most important for gap-filling)
+                        # Create 1-3 thin strips along depth axis
+                        num_strips = torch.randint(1, 4, (1,)).item()
+                        strip_width = torch.randint(4, 16, (1,)).item()  # 4-16 voxels wide
+
+                        for _ in range(num_strips):
+                            if D > strip_width:
+                                start_pos = torch.randint(0, D - strip_width + 1, (1,)).item()
+                                mask[b, :, start_pos : start_pos + strip_width, :, :] = 1
+
+                    elif strip_type == 1:  # Height strips
+                        num_strips = torch.randint(1, 3, (1,)).item()
+                        strip_width = torch.randint(4, min(H // 3, 16), (1,)).item()
+
+                        for _ in range(num_strips):
+                            if H > strip_width:
+                                start_pos = torch.randint(0, H - strip_width + 1, (1,)).item()
+                                mask[b, :, :, start_pos : start_pos + strip_width, :] = 1
+
+                    else:  # Width strips
+                        num_strips = torch.randint(1, 3, (1,)).item()
+                        strip_width = torch.randint(4, min(W // 3, 16), (1,)).item()
+
+                        for _ in range(num_strips):
+                            if W > strip_width:
+                                start_pos = torch.randint(0, W - strip_width + 1, (1,)).item()
+                                mask[b, :, :, :, start_pos : start_pos + strip_width] = 1
+
+                else:
+                    # Use smaller central blocks (similar to existing central_large_block but smaller)
+                    min_ratio = 0.2  # Smaller than mixed_edge_central
+                    max_ratio = 0.5  # Smaller than mixed_edge_central
+
+                    # Random block dimensions as a ratio of the full dimension
+                    block_d_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+                    block_h_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+                    block_w_ratio = min_ratio + torch.rand(1).item() * (max_ratio - min_ratio)
+
+                    block_d = max(1, int(block_d_ratio * D))
+                    block_h = max(1, int(block_h_ratio * H))
+                    block_w = max(1, int(block_w_ratio * W))
+
+                    # Calculate start position to center the block, with slight jitter
+                    jitter_factor = 0.1
+
+                    max_offset_d = int(jitter_factor * (D - block_d)) if (D - block_d) > 0 else 0
+                    max_offset_h = int(jitter_factor * (H - block_h)) if (H - block_h) > 0 else 0
+                    max_offset_w = int(jitter_factor * (W - block_w)) if (W - block_w) > 0 else 0
+
+                    offset_d = torch.randint(-max_offset_d, max_offset_d + 1, (1,)).item() if max_offset_d > 0 else 0
+                    offset_h = torch.randint(-max_offset_h, max_offset_h + 1, (1,)).item() if max_offset_h > 0 else 0
+                    offset_w = torch.randint(-max_offset_w, max_offset_w + 1, (1,)).item() if max_offset_w > 0 else 0
+
+                    # Ideal start for centered block
+                    center_start_d = (D - block_d) // 2
+                    center_start_h = (H - block_h) // 2
+                    center_start_w = (W - block_w) // 2
+
+                    # Apply jitter and ensure it stays within bounds
+                    start_d = max(0, min(D - block_d, center_start_d + offset_d))
+                    start_h = max(0, min(H - block_h, center_start_h + offset_h))
+                    start_w = max(0, min(W - block_w, center_start_w + offset_w))
+
+                    mask[
+                        b, :, start_d : start_d + block_d, start_h : start_h + block_h, start_w : start_w + block_w
+                    ] = 1
+
         return mask
