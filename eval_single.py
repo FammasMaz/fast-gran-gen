@@ -18,6 +18,9 @@ from pathlib import Path
 import logging
 import time
 
+# Add tqdm for progress bars
+from tqdm.auto import tqdm
+
 # Add PyVista import for VTU saving
 try:
     import pyvista as pv
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 # sys.path.append(str(Path(__file__).resolve().parent.parent)) # Adjust if utils are in parent
 
 from diffusers import DDIMScheduler, DDPMPipeline  # Assuming DDPMPipeline can load inpainting models too
+from diffusers import DDPMScheduler  # Explicit import for type checking
 
 
 def save_volume_as_vti(volume_data_np, vti_save_path, args_for_saving, descriptive_name="Volume"):
@@ -98,7 +102,7 @@ def parse_arguments():
         type=str,
         default="ddim",
         choices=["ddim", "ddpm"],
-        help="Scheduler type for both pipelines",
+        help="Scheduler type for both pipelines. Ensure it matches the loaded scheduler config if not re-initialized.",
     )
 
     # Output
@@ -153,6 +157,9 @@ def main():
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    # Create the generator on the target device.
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
@@ -160,55 +167,134 @@ def main():
         # Load base unconditional model
         logger.info(f"Loading BASE diffusion pipeline from: {args.model_path}")
         base_pipeline = DDPMPipeline.from_pretrained(args.model_path)
+        # Ensure correct scheduler is loaded/re-initialized based on args.scheduler_type
+        # The from_pretrained might load a scheduler, this ensures we use the one specified or re-init it.
         if args.scheduler_type == "ddim":
-            base_pipeline.scheduler = DDIMScheduler.from_config(
-                base_pipeline.scheduler.config
-            )  # Re-init from config for DDIM
-        base_pipeline = base_pipeline.to(device)
-        logger.info(f"Base pipeline loaded with {args.scheduler_type.upper()} scheduler.")
+            scheduler_config_path = Path(args.model_path) / "scheduler" / "scheduler_config.json"
+            if scheduler_config_path.exists():
+                base_pipeline.scheduler = DDIMScheduler.from_pretrained(Path(args.model_path) / "scheduler")
+            else:
+                logger.warning(
+                    f"DDIM scheduler config not found at {scheduler_config_path}. Initializing DDIMScheduler from base model's scheduler config."
+                )
+                base_pipeline.scheduler = DDIMScheduler.from_config(base_pipeline.scheduler.config)
+        elif (
+            args.scheduler_type == "ddpm"
+        ):  # Assuming DDPMPipeline might load DDIMScheduler by default from some checkpoints
+            scheduler_config_path = Path(args.model_path) / "scheduler" / "scheduler_config.json"
+            if (
+                scheduler_config_path.exists()
+                and "DDPMScheduler" in Path(args.model_path).joinpath("scheduler/scheduler_config.json").read_text()
+            ):
+                base_pipeline.scheduler = DDPMScheduler.from_pretrained(Path(args.model_path) / "scheduler")
+            else:
+                logger.warning(
+                    f"DDPMScheduler config not found or not specified at {scheduler_config_path}. Initializing DDPMScheduler from base model's scheduler config."
+                )
+                base_pipeline.scheduler = DDPMScheduler.from_config(base_pipeline.scheduler.config)
+
+        base_pipeline = base_pipeline.to(device)  # Move entire pipeline to device
+        base_unet = base_pipeline.unet  # Keep unet on device
+        base_scheduler = base_pipeline.scheduler  # Scheduler is not a nn.Module, but its methods use tensors
+
+        logger.info(f"Base pipeline's UNet and Scheduler ({type(base_scheduler).__name__}) ready on {device}.")
 
         # Load inpainting model
         logger.info(f"Loading INPAINTING diffusion pipeline from: {args.inpainting_model_path}")
-        inpainting_pipeline = DDPMPipeline.from_pretrained(args.inpainting_model_path)
+        inpainting_pipeline_obj = DDPMPipeline.from_pretrained(args.inpainting_model_path)
         if args.scheduler_type == "ddim":
-            inpainting_pipeline.scheduler = DDIMScheduler.from_config(
-                inpainting_pipeline.scheduler.config
-            )  # Re-init for DDIM
-        inpainting_pipeline = inpainting_pipeline.to(device)
-
-        # Compatibility for schedulers if loaded from different paths potentially
-        if args.scheduler_type == "ddim":
-            if not os.path.exists(Path(args.model_path) / "scheduler"):
-                logger.warning(
-                    f"Scheduler config for base model not found at {Path(args.model_path) / 'scheduler'}. Using default {args.scheduler_type} init."
-                )
-            else:
-                base_pipeline.scheduler = DDIMScheduler.from_pretrained(Path(args.model_path) / "scheduler")
-            if not os.path.exists(Path(args.inpainting_model_path) / "scheduler"):
-                logger.warning(
-                    f"Scheduler config for inpainting model not found at {Path(args.inpainting_model_path) / 'scheduler'}. Using default {args.scheduler_type} init."
-                )
-            else:
-                inpainting_pipeline.scheduler = DDIMScheduler.from_pretrained(
+            scheduler_config_path = Path(args.inpainting_model_path) / "scheduler" / "scheduler_config.json"
+            if scheduler_config_path.exists():
+                inpainting_pipeline_obj.scheduler = DDIMScheduler.from_pretrained(
                     Path(args.inpainting_model_path) / "scheduler"
                 )
+            else:
+                logger.warning(
+                    f"DDIM scheduler config not found for inpainting model at {scheduler_config_path}. Initializing DDIMScheduler from its scheduler config."
+                )
+                inpainting_pipeline_obj.scheduler = DDIMScheduler.from_config(inpainting_pipeline_obj.scheduler.config)
+        elif args.scheduler_type == "ddpm":
+            scheduler_config_path = Path(args.inpainting_model_path) / "scheduler" / "scheduler_config.json"
+            if (
+                scheduler_config_path.exists()
+                and "DDPMScheduler"
+                in Path(args.inpainting_model_path).joinpath("scheduler/scheduler_config.json").read_text()
+            ):
+                inpainting_pipeline_obj.scheduler = DDPMScheduler.from_pretrained(
+                    Path(args.inpainting_model_path) / "scheduler"
+                )
+            else:
+                logger.warning(
+                    f"DDPMScheduler config not found or not specified for inpainting model at {scheduler_config_path}. Initializing DDPMScheduler from its scheduler config."
+                )
+                inpainting_pipeline_obj.scheduler = DDPMScheduler.from_config(inpainting_pipeline_obj.scheduler.config)
 
-        base_pipeline.to(device)
-        inpainting_pipeline.to(device)
-        logger.info(f"Inpainting pipeline loaded with {args.scheduler_type.upper()} scheduler.")
+        inpainting_pipeline_obj = inpainting_pipeline_obj.to(device)
+        inpainting_unet = inpainting_pipeline_obj.unet
+        inpainting_scheduler = inpainting_pipeline_obj.scheduler
+        logger.info(
+            f"Inpainting pipeline's UNet and Scheduler ({type(inpainting_scheduler).__name__}) ready on {device}."
+        )
+
+        # Delete full pipeline objects to free memory
+        del base_pipeline
+        del inpainting_pipeline_obj
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Ensure inpainting UNet is configured for inpainting mode
+        if not (hasattr(inpainting_unet, "inpainting_mode") and inpainting_unet.inpainting_mode) and not (
+            hasattr(inpainting_unet, "config")
+            and hasattr(inpainting_unet.config, "inpainting_mode")
+            and inpainting_unet.config.inpainting_mode
+        ):
+            logger.warning(
+                "INPAINTING UNET MAY NOT BE IN INPAINTING MODE. The UNet should have an 'inpainting_mode=True' attribute/config and expect concatenated input [latent, mask, masked_original]."
+            )
+        else:
+            logger.info("Inpainting UNet appears to be configured for inpainting_mode.")
+
         logger.info("Models loaded successfully.")
 
-        # 1. Generate initial block
-        logger.info("Generating initial block...")
-        generator = torch.Generator(device=device).manual_seed(args.seed)  # Use same device as model for consistency
+        # 1. Generate initial block using manual diffusion loop
+        logger.info("Generating initial block (manual loop)...")
 
-        # Assuming pipeline output is (batch, channels, D, H, W)
-        initial_block_tensor = base_pipeline(
-            batch_size=1,
-            generator=generator,
-            num_inference_steps=args.inference_steps,
-            output_type="pt",  # Ensure PyTorch tensor output
-        ).images
+        # Determine shape from UNet config
+        if (
+            not hasattr(base_unet, "config")
+            or not hasattr(base_unet.config, "sample_size")
+            or not hasattr(base_unet.config, "in_channels")
+        ):
+            logger.error(
+                "Base UNet does not have 'config.sample_size' or 'config.in_channels'. Cannot determine generation shape."
+            )
+            sys.exit(1)
+
+        D, H, W = base_unet.config.sample_size  # Should be (Depth, Height, Width)
+        C = base_unet.config.in_channels  # Should be 1 for unconditional base model usually
+
+        latents = torch.randn(
+            (1, C, D, H, W),  # Batch, Channels, Depth, Height, Width
+            generator=generator,  # Use the CPU generator
+            device=device,  # Create on target device
+            dtype=base_unet.dtype,
+        )
+
+        if isinstance(base_scheduler, DDPMScheduler):  # DDPMPipeline scales init noise
+            latents = latents * base_scheduler.init_noise_sigma
+
+        base_scheduler.set_timesteps(args.inference_steps, device=device)
+        timesteps = base_scheduler.timesteps
+
+        with torch.no_grad():
+            for t in tqdm(timesteps, desc="Base Generation"):
+                # model_input is latents for unconditional
+                model_output = base_unet(latents, t).sample  # sample is the 5D output
+                latents = base_scheduler.step(model_output, t, latents, generator=generator).prev_sample
+
+        initial_block_tensor = latents  # This is the 5D tensor: (B, C, D, H, W)
+        # Denormalize if necessary (common practice for diffusion models)
+        initial_block_tensor = (initial_block_tensor / 2 + 0.5).clamp(0, 1)
 
         initial_block_np = initial_block_tensor.cpu().numpy().squeeze()  # Remove batch and channel if C=1
         # If channel is not 1, this squeeze might be problematic. Assuming C=1 for voxel data.
@@ -241,26 +327,56 @@ def main():
         # Diffusers inpainting pipelines usually expect:
         # - image: The original image (content for unmasked areas).
         # - mask_image: The mask (1s for areas to be inpainted, 0s for context).
-        image_for_inpainting = (
-            torch.from_numpy(initial_block_np).unsqueeze(0).unsqueeze(0).to(device)
+
+        # `initial_block_tensor` is the generated block, (B,C,D,H,W)
+        image_for_inpainting = initial_block_tensor.clone().to(device)  # Use the tensor directly
+        mask_for_inpainting = (
+            torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device, dtype=image_for_inpainting.dtype)
         )  # (B, C, D, H, W)
-        mask_for_inpainting = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device)  # (B, C, D, H, W)
 
         masked_input_for_saving_np = initial_block_np * (1.0 - mask_np)  # For saving the "holey" input
 
-        # 4. Perform inpainting
-        logger.info("Performing inpainting...")
-        # Ensure generator is on the same device
-        if generator.device.type != device.type:
-            generator = torch.Generator(device=device).manual_seed(args.seed)
+        # 4. Perform inpainting using manual diffusion loop
+        logger.info("Performing inpainting (manual loop)...")
 
-        inpainted_result_tensor = inpainting_pipeline(
-            image=image_for_inpainting,
-            mask_image=mask_for_inpainting,
-            num_inference_steps=args.inference_steps,
-            generator=generator,  # Re-use generator with correct device
-            output_type="pt",
-        ).images
+        masked_original_tensor = image_for_inpainting * (1.0 - mask_for_inpainting)  # B,C,D,H,W
+
+        # Initial latents for inpainting (noisy image to be denoised in masked areas)
+        current_latents_to_denoise = torch.randn_like(
+            image_for_inpainting,  # B, C, D, H, W
+        )
+
+        if isinstance(inpainting_scheduler, DDPMScheduler):  # DDPMPipeline scales init noise
+            current_latents_to_denoise = current_latents_to_denoise * inpainting_scheduler.init_noise_sigma
+
+        inpainting_scheduler.set_timesteps(args.inference_steps, device=device)
+        inpainting_timesteps = inpainting_scheduler.timesteps
+
+        # Ensure mask_for_inpainting and masked_original_tensor have same dtype as current_latents_to_denoise
+        mask_for_inpainting = mask_for_inpainting.to(dtype=current_latents_to_denoise.dtype)
+        masked_original_tensor = masked_original_tensor.to(dtype=current_latents_to_denoise.dtype)
+
+        with torch.no_grad():
+            for t in tqdm(inpainting_timesteps, desc="Inpainting"):
+                # At each step, the UNet input is: [current_noisy_latent, mask, masked_original_image]
+                # Assuming C=1 for each part, so total input channels for UNet = 3
+                # This matches UNet3DModel's inpainting_mode logic: conv_in_channels = (in_channels * 2 + 1)
+                # where in_channels is for the 'latent' part.
+
+                model_input = torch.cat(
+                    [current_latents_to_denoise, mask_for_inpainting, masked_original_tensor], dim=1
+                )
+
+                unet_output = inpainting_unet(model_input, t).sample  # sample is the 5D output (noise prediction)
+
+                # The scheduler step denoises current_latents_to_denoise
+                current_latents_to_denoise = inpainting_scheduler.step(
+                    unet_output, t, current_latents_to_denoise, generator=generator
+                ).prev_sample
+
+        inpainted_result_tensor = current_latents_to_denoise
+        # Denormalize if necessary
+        inpainted_result_tensor = (inpainted_result_tensor / 2 + 0.5).clamp(0, 1)
 
         inpainted_result_np = inpainted_result_tensor.cpu().numpy().squeeze()
         if inpainted_result_np.ndim == 4 and inpainted_result_np.shape[0] == 1:
