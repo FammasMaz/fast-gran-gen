@@ -484,7 +484,7 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         sample: torch.FloatTensor,  # if inpainting mode, this is the concat [latent, mask, masked_latent]
         timestep: torch.LongTensor,
         return_dict: bool = True,
-    ) -> torch.FloatTensor:
+    ):
         # 1. Check inputs, inpainting or not.
         expected_channels = (
             (self._original_in_channels * 2 + 1) if self.inpainting_mode else self._original_in_channels
@@ -541,8 +541,10 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         h = self.conv_act(h)  # silu activation
         sample = self.conv_out(h)  # final convolution to get binary mask
 
+        class UNetOutput:
+            def __init__(self, sample):
+                self.sample = sample
+
         if not return_dict:
             return (sample,)
-
-        # TODO: return a dataclass if asked, not currently used but might be useful for generalization
-        return (sample,)
+        return UNetOutput(sample)
