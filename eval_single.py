@@ -200,9 +200,7 @@ def main():
 
         # 1. Generate initial block
         logger.info("Generating initial block...")
-        generator = torch.Generator(device="cpu").manual_seed(
-            args.seed
-        )  # CPU generator for reproducibility across devices
+        generator = torch.Generator(device=device).manual_seed(args.seed)  # Use same device as model for consistency
 
         # Assuming pipeline output is (batch, channels, D, H, W)
         initial_block_tensor = base_pipeline(
@@ -252,11 +250,15 @@ def main():
 
         # 4. Perform inpainting
         logger.info("Performing inpainting...")
+        # Ensure generator is on the same device
+        if generator.device.type != device.type:
+            generator = torch.Generator(device=device).manual_seed(args.seed)
+
         inpainted_result_tensor = inpainting_pipeline(
             image=image_for_inpainting,
             mask_image=mask_for_inpainting,
             num_inference_steps=args.inference_steps,
-            generator=generator,  # Re-use generator, or new one with same seed
+            generator=generator,  # Re-use generator with correct device
             output_type="pt",
         ).images
 
