@@ -288,28 +288,30 @@ def generate_blocks_with_gaps_and_inpaint(
 
                     # Scheduler step
                     step_output = inpainting_scheduler.step(noise_pred, t, latents)
-                    prev_sample = step_output.prev_sample
+                    latents = step_output.prev_sample
 
-                    # For known regions (mask=0), blend with original content
-                    # This ensures we don't modify the existing blocks, only fill the gap
+                    # REPAINT GUIDANCE: For known regions, replace with properly noised original content
+                    # This is the key fix - we don't blend during denoising, we replace known regions
                     if t != timesteps[-1]:  # Not the final step
-                        # Add appropriate noise to original content to match current timestep
-                        timestep_idx = (t == inpainting_scheduler.timesteps).nonzero().item()
-                        prev_timestep_idx = min(timestep_idx + 1, len(inpainting_scheduler.timesteps) - 1)
-                        prev_timestep = inpainting_scheduler.timesteps[prev_timestep_idx]
-                        prev_timestep = prev_timestep.to(dtype=torch.long, device=device)
+                        # Add appropriate amount of noise to original content for current timestep
+                        # Find the next timestep
+                        current_idx = (timesteps == t).nonzero(as_tuple=True)[0].item()
+                        if current_idx < len(timesteps) - 1:
+                            next_timestep = timesteps[current_idx + 1]
+                        else:
+                            next_timestep = torch.tensor(0, device=device, dtype=timesteps.dtype)
 
-                        # Add noise to original image to match previous timestep
-                        # Use the fixed base_noise_for_original_content
-                        original_noised = inpainting_scheduler.add_noise(
-                            process_region_b, base_noise_for_original_content, prev_timestep
+                        # Add noise to original content to match next timestep
+                        original_with_noise = inpainting_scheduler.add_noise(
+                            process_region_b, base_noise_for_original_content, next_timestep.unsqueeze(0)
                         )
 
-                        # Combine: use predicted sample in gap, original (noised) content in known regions
-                        latents = prev_sample * mask_b + original_noised * (1.0 - mask_b)
+                        # Replace known regions (mask=0) with noisy original content
+                        # Keep predicted content in unknown regions (mask=1)
+                        latents = latents * mask_b + original_with_noise * (1.0 - mask_b)
                     else:
-                        # Final step: use original content for known regions, predicted for gap
-                        latents = prev_sample * mask_b + process_region_b * (1.0 - mask_b)
+                        # Final step: use clean original content for known regions
+                        latents = latents * mask_b + process_region_b * (1.0 - mask_b)
 
             # Place the inpainted result back into the full volume
             inpainted_result = latents.squeeze(0)  # Remove batch dim
