@@ -87,10 +87,44 @@ def parse_arguments():
     )
     parser.add_argument("--inpainting_model_path", type=str, required=True, help="Path to inpainting model")
 
-    # Generation and Masking parameters
+    # --- Masking Strategy ---
     parser.add_argument(
-        "--mask_ratio", type=float, default=0.3, help="Ratio of voxels to randomly mask for inpainting (0.0 to 1.0)"
+        "--masking_type",
+        type=str,
+        default="random_voxel",
+        choices=["random_voxel", "internal_block"],
+        help="Type of mask to apply: 'random_voxel' or 'internal_block'.",
     )
+
+    # Parameters for 'random_voxel' masking
+    parser.add_argument(
+        "--mask_ratio",
+        type=float,
+        default=0.3,
+        help="Ratio of voxels to randomly mask (used if masking_type='random_voxel')",
+    )
+
+    # Parameters for 'internal_block' masking
+    parser.add_argument(
+        "--num_masked_blocks",
+        type=int,
+        default=1,
+        help="Number of internal blocks to mask (used if masking_type='internal_block')",
+    )
+    parser.add_argument(
+        "--masked_block_min_dim_ratio",
+        type=float,
+        default=0.2,
+        help="Min D,H,W ratio for internal masked blocks (used if masking_type='internal_block')",
+    )
+    parser.add_argument(
+        "--masked_block_max_dim_ratio",
+        type=float,
+        default=0.4,
+        help="Max D,H,W ratio for internal masked blocks (used if masking_type='internal_block')",
+    )
+
+    # --- Generation and Inpainting parameters ---
     parser.add_argument(
         "--inference_steps", type=int, default=50, help="Number of inference steps for generation and inpainting"
     )
@@ -141,7 +175,13 @@ def main():
     logger.info("=== Single Block Inpainting Evaluation ===")
     logger.info(f"Unconditional model: {args.model_path}")
     logger.info(f"Inpainting model: {args.inpainting_model_path}")
-    logger.info(f"Mask ratio: {args.mask_ratio}")
+    logger.info(f"Masking type: {args.masking_type}")
+    if args.masking_type == "random_voxel":
+        logger.info(f"  Mask ratio: {args.mask_ratio}")
+    elif args.masking_type == "internal_block":
+        logger.info(f"  Num masked blocks: {args.num_masked_blocks}")
+        logger.info(f"  Masked block min dim ratio: {args.masked_block_min_dim_ratio}")
+        logger.info(f"  Masked block max dim ratio: {args.masked_block_max_dim_ratio}")
     logger.info(f"Output directory: {output_dir}")
     if not PYVISTA_AVAILABLE:
         logger.warning("PyVista not available. VTI saving will be skipped for all outputs.")
@@ -308,18 +348,64 @@ def main():
 
         logger.info(f"Initial block generated. Shape: {initial_block_np.shape}")
 
-        # 2. Create random mask
-        logger.info(f"Creating random mask with ratio: {args.mask_ratio}...")
+        # 2. Create mask based on strategy
+        logger.info(f"Creating mask using '{args.masking_type}' strategy...")
         D, H, W = initial_block_np.shape
-
         mask_np = np.zeros_like(initial_block_np, dtype=np.float32)
-        num_total_voxels = D * H * W
-        num_voxels_to_mask = int(args.mask_ratio * num_total_voxels)
 
-        if num_voxels_to_mask > 0:
-            flat_indices = np.random.choice(num_total_voxels, size=num_voxels_to_mask, replace=False)
-            coords_to_mask = np.unravel_index(flat_indices, (D, H, W))
-            mask_np[coords_to_mask] = 1.0  # 1.0 where we want to inpaint
+        if args.masking_type == "random_voxel":
+            num_total_voxels = D * H * W
+            num_voxels_to_mask = int(args.mask_ratio * num_total_voxels)
+            if num_voxels_to_mask > 0:
+                flat_indices = np.random.choice(num_total_voxels, size=num_voxels_to_mask, replace=False)
+                coords_to_mask = np.unravel_index(flat_indices, (D, H, W))
+                mask_np[coords_to_mask] = 1.0  # 1.0 where we want to inpaint
+            logger.info(f"Random voxel mask created. Num masked voxels: {np.sum(mask_np):.0f}")
+
+        elif args.masking_type == "internal_block":
+            for i in range(args.num_masked_blocks):
+                # Determine random dimensions for the block to mask
+                block_d = np.random.randint(
+                    int(D * args.masked_block_min_dim_ratio), int(D * args.masked_block_max_dim_ratio) + 1
+                )
+                block_h = np.random.randint(
+                    int(H * args.masked_block_min_dim_ratio), int(H * args.masked_block_max_dim_ratio) + 1
+                )
+                block_w = np.random.randint(
+                    int(W * args.masked_block_min_dim_ratio), int(W * args.masked_block_max_dim_ratio) + 1
+                )
+
+                # Ensure block dimensions are at least 1
+                block_d = max(1, block_d)
+                block_h = max(1, block_h)
+                block_w = max(1, block_w)
+
+                # Determine random starting position for the block
+                # Ensure the block fits within the main volume dimensions
+                if D - block_d <= 0:
+                    start_d = 0
+                else:
+                    start_d = np.random.randint(0, D - block_d)
+
+                if H - block_h <= 0:
+                    start_h = 0
+                else:
+                    start_h = np.random.randint(0, H - block_h)
+
+                if W - block_w <= 0:
+                    start_w = 0
+                else:
+                    start_w = np.random.randint(0, W - block_w)
+
+                mask_np[start_d : start_d + block_d, start_h : start_h + block_h, start_w : start_w + block_w] = 1.0
+                logger.info(f"Masked internal block {i + 1}/{args.num_masked_blocks}: ")
+                logger.info(
+                    f"  at D[{start_d}:{start_d + block_d}], H[{start_h}:{start_h + block_h}], W[{start_w}:{start_w + block_w}]"
+                )
+            logger.info(f"Internal block mask created. Total masked voxels: {np.sum(mask_np):.0f}")
+        else:
+            logger.error(f"Unknown masking type: {args.masking_type}")
+            sys.exit(1)
 
         logger.info(f"Mask created. Shape: {mask_np.shape}, Num masked voxels: {np.sum(mask_np):.0f}")
 
