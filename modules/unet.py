@@ -503,6 +503,17 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         #      pass
 
         # 2. Time embedding
+        # Ensure timestep is properly formatted as 1D tensor and on the correct device
+        if not isinstance(timestep, torch.Tensor):
+            timestep = torch.tensor([timestep], device=sample.device, dtype=torch.long)
+        elif timestep.dim() == 0:  # scalar tensor
+            timestep = timestep.unsqueeze(0)
+        elif timestep.dim() > 1:  # multi-dimensional tensor, flatten to 1D
+            timestep = timestep.flatten()
+
+        # Ensure timestep is on the same device as the model
+        timestep = timestep.to(sample.device)
+
         t_emb = self.time_proj(timestep)
         emb = self.time_embedding(t_emb)
 
