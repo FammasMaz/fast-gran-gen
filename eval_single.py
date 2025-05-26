@@ -332,11 +332,11 @@ def main():
                 model_output = base_unet(latents, t).sample  # sample is the 5D output
                 latents = base_scheduler.step(model_output, t, latents, generator=generator).prev_sample
 
-        initial_block_tensor = latents  # This is the 5D tensor: (B, C, D, H, W)
-        # Denormalize if necessary (common practice for diffusion models)
-        initial_block_tensor = (initial_block_tensor / 2 + 0.5).clamp(0, 1)
+        raw_initial_block_tensor = latents.clone()  # This is the 5D tensor in [-1, 1] range
+        # Denormalize for saving and general use as "original image"
+        initial_block_tensor_for_saving = (raw_initial_block_tensor / 2 + 0.5).clamp(0, 1)  # Now in [0,1]
 
-        initial_block_np = initial_block_tensor.cpu().numpy().squeeze()  # Remove batch and channel if C=1
+        initial_block_np = initial_block_tensor_for_saving.cpu().numpy().squeeze()  # Remove batch and channel if C=1
         # If channel is not 1, this squeeze might be problematic. Assuming C=1 for voxel data.
         if initial_block_np.ndim == 4 and initial_block_np.shape[0] == 1:  # (1,D,H,W)
             initial_block_np = initial_block_np.squeeze(0)
@@ -414,22 +414,27 @@ def main():
         # - image: The original image (content for unmasked areas).
         # - mask_image: The mask (1s for areas to be inpainted, 0s for context).
 
-        # `initial_block_tensor` is the generated block, (B,C,D,H,W)
-        image_for_inpainting = initial_block_tensor.clone().to(device)  # Use the tensor directly
+        # `initial_block_tensor_for_saving` is the generated block, (B,C,D,H,W) in [0,1] range
+        # `raw_initial_block_tensor` is in [-1,1] range
+        # image_for_inpainting was previously based on the [0,1] tensor.
+        # Let's ensure the UNet input for masked_original is from the [-1,1] range data.
+
         mask_for_inpainting = (
-            torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device, dtype=image_for_inpainting.dtype)
+            torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).to(device, dtype=raw_initial_block_tensor.dtype)
         )  # (B, C, D, H, W)
 
-        masked_input_for_saving_np = initial_block_np * (1.0 - mask_np)  # For saving the "holey" input
+        # This is for saving the "holey" input, based on the [0,1] scaled data
+        masked_input_for_saving_np = initial_block_np * (1.0 - mask_np)
 
         # 4. Perform inpainting using manual diffusion loop
         logger.info("Performing inpainting (manual loop)...")
 
-        masked_original_tensor = image_for_inpainting * (1.0 - mask_for_inpainting)  # B,C,D,H,W
+        # Create the masked_original_tensor for UNet input from the raw [-1,1] data
+        masked_original_tensor_for_unet = raw_initial_block_tensor * (1.0 - mask_for_inpainting)
 
         # Initial latents for inpainting (noisy image to be denoised in masked areas)
         current_latents_to_denoise = torch.randn_like(
-            image_for_inpainting,  # B, C, D, H, W
+            raw_initial_block_tensor,  # B, C, D, H, W
         )
 
         if isinstance(inpainting_scheduler, DDPMScheduler):  # DDPMPipeline scales init noise
@@ -438,19 +443,15 @@ def main():
         inpainting_scheduler.set_timesteps(args.inference_steps, device=device)
         inpainting_timesteps = inpainting_scheduler.timesteps
 
-        # Ensure mask_for_inpainting and masked_original_tensor have same dtype as current_latents_to_denoise
+        # Ensure mask_for_inpainting and masked_original_tensor_for_unet have same dtype as current_latents_to_denoise
         mask_for_inpainting = mask_for_inpainting.to(dtype=current_latents_to_denoise.dtype)
-        masked_original_tensor = masked_original_tensor.to(dtype=current_latents_to_denoise.dtype)
+        masked_original_tensor_for_unet = masked_original_tensor_for_unet.to(dtype=current_latents_to_denoise.dtype)
 
         with torch.no_grad():
             for t in tqdm(inpainting_timesteps, desc="Inpainting"):
-                # At each step, the UNet input is: [current_noisy_latent, mask, masked_original_image]
-                # Assuming C=1 for each part, so total input channels for UNet = 3
-                # This matches UNet3DModel's inpainting_mode logic: conv_in_channels = (in_channels * 2 + 1)
-                # where in_channels is for the 'latent' part.
-
+                # At each step, the UNet input is: [current_noisy_latent, mask, masked_original_image_scaled_correctly]
                 model_input = torch.cat(
-                    [current_latents_to_denoise, mask_for_inpainting, masked_original_tensor], dim=1
+                    [current_latents_to_denoise, mask_for_inpainting, masked_original_tensor_for_unet], dim=1
                 )
 
                 unet_output = inpainting_unet(model_input, t).sample  # sample is the 5D output (noise prediction)
