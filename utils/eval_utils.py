@@ -73,7 +73,6 @@ def generate_overlapping_volume(
         "Model must be configured for inpainting mode."
     )
 
-    # generate a fixed random seed for generation
     if seed is None:
         seed = int(time.time())
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -113,10 +112,8 @@ def generate_overlapping_volume(
                 if known_latent_part is not None and overlap > 0:
                     masked_known_latent[:, :, :overlap, :, :] = known_latent_part
 
-                # scale the current latents
-                scaled_latents = scheduler.scale_model_input(latents, t)
-
-                unet_input = torch.cat([scaled_latents, mask, masked_known_latent], dim=1)
+                # For inpainting UNet: concatenate [noisy_latents, mask, masked_known_latent]
+                unet_input = torch.cat([latents, mask, masked_known_latent], dim=1)
 
                 # predict noise
                 t_input = t.repeat(1)  # batch size 1
@@ -168,7 +165,7 @@ def generate_overlapping_volume(
         else:
             context_latent = None
 
-        del block, scaled_latents, unet_input, noise_pred, prev_sample
+        del block, unet_input, noise_pred, prev_sample
         if "masked_known_latent" in locals():
             del masked_known_latent
         torch.cuda.empty_cache()
@@ -261,13 +258,11 @@ def generate_single_volume(
     unet.eval()
     with torch.no_grad():
         for t in scheduler.timesteps.to(device):
-            scaled_latents = scheduler.scale_model_input(latents, t)
-
             if mask is not None:
                 masked_input = torch.zeros_like(latents)
-                model_input = torch.cat([scaled_latents, mask, masked_input], dim=1)
+                model_input = torch.cat([latents, mask, masked_input], dim=1)
             else:
-                model_input = scaled_latents
+                model_input = latents
 
             t_input = t.repeat(batch_size)
             noise_pred = unet(model_input, t_input, return_dict=False)[0]
@@ -290,9 +285,8 @@ def generate_single_volume(
                 scheduler.set_timesteps(num_steps)
                 with torch.no_grad():
                     for t in scheduler.timesteps.to(device):
-                        latent_model_input = scheduler.scale_model_input(single_latent, t)
                         t_input = t.repeat(1)
-                        noise_pred = unet(latent_model_input, t_input, return_dict=False)[0]
+                        noise_pred = unet(single_latent, t_input, return_dict=False)[0]
                         single_latent = scheduler.step(noise_pred, t, single_latent).prev_sample
 
                 block_cpu = single_latent[0].cpu().squeeze(0)  # (D, H, W)
@@ -672,38 +666,46 @@ def generate_stitched_volume_with_inpainting(
                     # Create initial noise
                     latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
 
-                    # Run the diffusion loop
+                    masked_images = image_slice_b * (1.0 - mask_b) - mask_b
+
+                    # Scale initial noise if needed
+                    if hasattr(inpainting_scheduler, "init_noise_sigma"):
+                        latents = latents * inpainting_scheduler.init_noise_sigma
+
                     with torch.no_grad():
-                        for t in tqdm(timesteps, desc=f"  Inpainting Iteration {iter_idx + 1}", leave=False):
-                            # Create masked image: original in non-masked areas, zeros in masked areas
-                            masked_image = image_slice_b * (1.0 - mask_b)
+                        for i_step, t in enumerate(
+                            tqdm(timesteps, desc=f"  Inpainting Iteration {iter_idx + 1}", leave=False)
+                        ):
+                            t_input = t.repeat(image_slice_b.shape[0])  # Batch size
 
-                            scaled_latents = inpainting_scheduler.scale_model_input(latents, t)
+                            # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
+                            unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
 
-                            unet_input = torch.cat([scaled_latents, mask_unet_input_b, masked_image], dim=1)
-
-                            t_input = t.repeat(image_slice_b.shape[0]).to(device)
-
+                            # Predict noise
                             noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
 
-                            # Step in the diffusion process
-                            step_output = inpainting_scheduler.step(noise_pred, t, latents)
-                            prev_sample = step_output.prev_sample
+                            # Scheduler step
+                            step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
+                            x_prev_denoised_candidate = step_output.prev_sample
 
-                            # For areas outside the mask, blend with the original content
-                            timestep_idx = (t == inpainting_scheduler.timesteps).nonzero().item()
-                            prev_timestep_idx = min(timestep_idx + 1, len(inpainting_scheduler.timesteps) - 1)
-                            prev_timestep = inpainting_scheduler.timesteps[prev_timestep_idx]
-                            prev_timestep = prev_timestep.to(dtype=torch.long, device=device)
+                            # RePaint-like guidance: ensure known regions stay consistent
+                            if i_step < len(timesteps) - 1:
+                                # Add noise to the original image for the next timestep
+                                prev_t = timesteps[i_step + 1]
+                                noise_for_gt_conditioning = torch.randn(
+                                    image_slice_b.shape, device=device, dtype=image_slice_b.dtype
+                                )
 
-                            # Add noise to get original at previous timestep
-                            noise_for_orig = torch.randn(image_slice_b.shape, generator=generator, device=device)
-                            original_image_noised_prev_t = inpainting_scheduler.add_noise(
-                                image_slice_b, noise_for_orig, prev_timestep
-                            )
+                                # Always use the original scheduler for adding noise (matches training)
+                                x_prev_noised_known_gt = inpainting_scheduler.add_noise(
+                                    image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
+                                )
 
-                            # Combine results
-                            latents = prev_sample * mask_b + original_image_noised_prev_t * (1.0 - mask_b)
+                                # Composite: use inpainted prediction for masked areas, noisy GT for known areas
+                                latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
+                            else:
+                                # Last step: composite final x0 prediction
+                                latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
 
                     image_slice = latents.squeeze(0)
 
@@ -793,42 +795,44 @@ def generate_stitched_volume_with_inpainting(
                 # and conditionally denoise, using the non-masked parts as guidance
                 latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
 
+                masked_images = image_slice_b * (1.0 - mask_b) - mask_b
+
+                # Scale initial noise if needed
+                if hasattr(inpainting_scheduler, "init_noise_sigma"):
+                    latents = latents * inpainting_scheduler.init_noise_sigma
+
                 with torch.no_grad():
-                    for t in tqdm(timesteps, desc=f"  Inpainting Junction {i + 1}", leave=False):
-                        # 1. Create masked image: original image in non-masked areas, zeros in masked areas
-                        masked_image = image_slice_b * (1.0 - mask_b)
+                    for i_step, t in enumerate(tqdm(timesteps, desc=f"  Inpainting Junction {i + 1}", leave=False)):
+                        t_input = t.repeat(image_slice_b.shape[0])  # Batch size
 
-                        # 2. Scale the current latents
-                        scaled_latents = inpainting_scheduler.scale_model_input(latents, t)
+                        # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
+                        unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
 
-                        # 3. Concatenate: latents + mask + masked_image
-                        unet_input = torch.cat([scaled_latents, mask_unet_input_b, masked_image], dim=1)
-
-                        # 4. Ensure timestep tensor is on the correct device
-                        t_input = t.repeat(image_slice_b.shape[0]).to(device)
-
-                        # 5. Predict noise
+                        # Predict noise
                         noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
 
-                        # 6. Scheduler step to get next sample
-                        step_output = inpainting_scheduler.step(noise_pred, t, latents)
-                        prev_sample = step_output.prev_sample
+                        # Scheduler step
+                        step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
+                        x_prev_denoised_candidate = step_output.prev_sample
 
-                        # 7. For areas outside the mask, blend in the original content for guidance
-                        # Calculate the timestep index
-                        timestep_idx = (t == inpainting_scheduler.timesteps).nonzero().item()
-                        prev_timestep_idx = min(timestep_idx + 1, len(inpainting_scheduler.timesteps) - 1)
-                        prev_timestep = inpainting_scheduler.timesteps[prev_timestep_idx]
-                        prev_timestep = prev_timestep.to(dtype=torch.long, device=device)
+                        # RePaint-like guidance: ensure known regions stay consistent
+                        if i_step < len(timesteps) - 1:
+                            # Add noise to the original image for the next timestep
+                            prev_t = timesteps[i_step + 1]
+                            noise_for_gt_conditioning = torch.randn(
+                                image_slice_b.shape, device=device, dtype=image_slice_b.dtype
+                            )
 
-                        # Add noise to get the original image at the previous timestep
-                        noise_for_orig = torch.randn(image_slice_b.shape, generator=generator, device=device)
-                        original_image_noised_prev_t = inpainting_scheduler.add_noise(
-                            image_slice_b, noise_for_orig, prev_timestep
-                        )
+                            # Always use the original scheduler for adding noise (matches training)
+                            x_prev_noised_known_gt = inpainting_scheduler.add_noise(
+                                image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
+                            )
 
-                        # Combine: replace non-masked areas with noised original image
-                        latents = prev_sample * mask_b + original_image_noised_prev_t * (1.0 - mask_b)
+                            # Composite: use inpainted prediction for masked areas, noisy GT for known areas
+                            latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
+                        else:
+                            # Last step: composite final x0 prediction
+                            latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
 
                 # Final result
                 inpainted_result_latent = latents
