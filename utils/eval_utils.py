@@ -527,10 +527,20 @@ def generate_stitched_volume_with_inpainting(
             np.save(debug_dir / f"block_{i:03d}.npy", block)
         logger.info(f"Saved intermediate blocks to {debug_dir}")
 
-    # assemble blocks for inpainting
-    step = D - overlap
-    total_depth = D + (n_blocks - 1) * step
-    logger.info(f"Total stitched volume depth: {total_depth} ({n_blocks} blocks, {D=}, {overlap=}, {step=})")
+    # Check if we should use gap-filling mode (true gaps) or overlapping mode (seams)
+    use_gap_filling = hasattr(args, "mask_type") and args.mask_type == "gap_filling_compatible"
+
+    if use_gap_filling:
+        # Gap-filling mode: create true gaps between blocks
+        gap_size = overlap  # In gap mode, "overlap" parameter defines gap size
+        step = D + gap_size  # Blocks are separated by gap_size
+        total_depth = n_blocks * D + (n_blocks - 1) * gap_size
+        logger.info(f"Gap-filling mode: {total_depth=} ({n_blocks} blocks, {D=}, {gap_size=}, {step=})")
+    else:
+        # Overlapping mode: blocks overlap and seams are inpainted
+        step = D - overlap
+        total_depth = D + (n_blocks - 1) * step
+        logger.info(f"Overlapping mode: {total_depth=} ({n_blocks} blocks, {D=}, {overlap=}, {step=})")
 
     C = base_unet.config.in_channels
     logger.info(f"Using {C} channels based on base_unet config.")
@@ -608,8 +618,18 @@ def generate_stitched_volume_with_inpainting(
 
         junction_idx = i + 1
 
-        junction_center_d = junction_idx * step
-        process_region_size = max(D, overlap * 3)
+        if use_gap_filling:
+            # In gap mode, junction center should be in the middle of the gap
+            # Gap starts at junction_idx * D + (junction_idx - 1) * gap_size = (junction_idx - 1) * step + D
+            gap_start = (junction_idx - 1) * step + D
+            junction_center_d = gap_start + gap_size // 2
+        else:
+            # In overlap mode, junction center is at the overlap point
+            junction_center_d = junction_idx * step
+        if use_gap_filling:
+            process_region_size = max(gap_size * 3, 16)  # Ensure sufficient context around gap
+        else:
+            process_region_size = max(D, overlap * 3)  # Original overlap logic
 
         region_start_d = max(0, junction_center_d - process_region_size // 2)
         region_end_d = min(total_depth, region_start_d + process_region_size)
@@ -631,7 +651,12 @@ def generate_stitched_volume_with_inpainting(
             junction_local_center = junction_center_d - region_start_d
 
             iter_sizes = []
-            base_mask_width = int(region_depth * inpaint_region_size_ratio)
+            if use_gap_filling:
+                # In gap mode, base mask width should cover the gap area
+                base_mask_width = gap_size
+            else:
+                # In overlap mode, use region ratio
+                base_mask_width = int(region_depth * inpaint_region_size_ratio)
             for iter_idx in range(inpaint_iterations):
                 size_factor = 1.0 - (iter_idx / inpaint_iterations) * 0.6  # Reduce up to 60%
                 iter_sizes.append(int(base_mask_width * size_factor))
@@ -725,32 +750,39 @@ def generate_stitched_volume_with_inpainting(
             inpainted_result_latent = image_slice.unsqueeze(0)
 
         else:
-            logger.info(
-                f"  Generating mask for junction {i + 1} using MaskGenerator3D with args.mask_type: {args.mask_type}"
-            )
-
-            # Get dimensions for the mask generator
+            # Get dimensions for mask creation
             # image_slice shape is (C, region_depth, H, W)
             _, current_region_depth, current_H, current_W = image_slice.shape
 
-            # Instantiate the mask generator with the main args (which includes central_large_block settings)
-            # The MaskGenerator3D will use args.mask_type and related parameters.
-            junction_mask_generator = MaskGenerator3D(args, num_channels=1)
-            # Generate the mask for the current junction slice (Batch=1, Channels=1)
-            mask_for_junction = junction_mask_generator([1, 1, current_region_depth, current_H, current_W])
-            mask_for_junction = mask_for_junction.squeeze(0)  # Remove batch dim -> (1, D, H, W)
-            mask = mask_for_junction.to(device)  # (1, D, H, W) or (C_mask, D, H, W) if num_channels > 1
+            if use_gap_filling:
+                logger.info(f"  Creating gap mask for junction {i + 1} (gap_filling_compatible mode)")
 
-            # Ensure mask has the same channel count as image_slice if image_slice has more than 1 (e.g. for RGB)
-            # However, our MaskGenerator3D is set to num_channels=1 for the mask itself.
-            # The inpainting UNet expects mask as 1 channel usually.
-            # So, mask should be [1, current_region_depth, current_H, current_W]
-            # If image_slice has C channels, the mask is typically broadcasted or used for all channels.
+                # Create a mask that covers the gap region in the center
+                junction_local_center = junction_center_d - region_start_d
+                mask_width = gap_size
+
+                mask_start = max(0, junction_local_center - mask_width // 2)
+                mask_end = min(current_region_depth, mask_start + mask_width)
+
+                mask = torch.zeros((1, current_region_depth, current_H, current_W), device=device)
+                mask[:, mask_start:mask_end, :, :] = 1.0
+
+                logger.info(f"  Created gap mask: width={mask_width}, start={mask_start}, end={mask_end}")
+            else:
+                logger.info(
+                    f"  Generating mask for junction {i + 1} using MaskGenerator3D with args.mask_type: {args.mask_type}"
+                )
+
+                # Instantiate the mask generator with the main args (which includes central_large_block settings)
+                # The MaskGenerator3D will use args.mask_type and related parameters.
+                junction_mask_generator = MaskGenerator3D(args, num_channels=1)
+                # Generate the mask for the current junction slice (Batch=1, Channels=1)
+                mask_for_junction = junction_mask_generator([1, 1, current_region_depth, current_H, current_W])
+                mask = mask_for_junction.squeeze(0).to(device)  # Remove batch dim -> (1, D, H, W)
 
             logger.info(f"  Generated mask shape for junction: {mask.shape}")
 
             # The mask input to the UNet usually has only 1 channel.
-            # MaskGenerator3D already produces num_channels=1 as specified.
             mask_unet_input = mask.unsqueeze(0)  # Add Batch dim back -> (1, 1, D, H, W)
 
             if output_dir:
