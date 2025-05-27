@@ -69,7 +69,7 @@ def inpaint_gap_repaint(
     inpainting_pipeline, volume_with_gap, mask, num_inference_steps, seed, device, guidance_scale=1.0
 ):
     """
-    Inpaint a gap using RePaint guidance approach.
+    Inpaint a gap using RePaint guidance approach - FIXED to match single_test.py methodology.
 
     Args:
         inpainting_pipeline: The inpainting diffusion pipeline
@@ -83,66 +83,61 @@ def inpaint_gap_repaint(
     Returns:
         Inpainted volume [1, C, D, H, W]
     """
-    from copy import deepcopy
+    print(f"Inpainting masked region with {num_inference_steps} steps...")
 
-    generator = torch.Generator(device=device).manual_seed(seed)
+    inpainting_unet = inpainting_pipeline.unet
+    inpainting_scheduler = inpainting_pipeline.scheduler
 
-    # Get scheduler and unet
-    scheduler = inpainting_pipeline.scheduler
-    unet = inpainting_pipeline.unet
+    # Create masked images (set masked areas to -1) - KEY FIX from single_test.py
+    masked_images = volume_with_gap * (1.0 - mask) - mask
 
-    # Create a local copy of scheduler to avoid device conflicts
-    local_scheduler = deepcopy(scheduler)
-    local_scheduler.set_timesteps(num_inference_steps)
+    # Initialize noise for inpainting
+    generator = torch.Generator(device=device).manual_seed(seed + 1)  # Different seed for inpainting
+    latents = torch.randn(volume_with_gap.shape, generator=generator, device=device, dtype=volume_with_gap.dtype)
 
-    # Move scheduler tensors to device if they exist
-    if hasattr(local_scheduler, "timesteps"):
-        local_scheduler.timesteps = local_scheduler.timesteps.to(device)
-    if hasattr(local_scheduler, "alphas_cumprod"):
-        local_scheduler.alphas_cumprod = local_scheduler.alphas_cumprod.to(device)
-    if hasattr(local_scheduler, "betas"):
-        local_scheduler.betas = local_scheduler.betas.to(device)
+    # Scale initial noise if needed
+    if hasattr(inpainting_scheduler, "init_noise_sigma"):
+        latents = latents * inpainting_scheduler.init_noise_sigma
 
-    timesteps = local_scheduler.timesteps
+    # Set timesteps
+    inpainting_scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = inpainting_scheduler.timesteps
 
-    # Initialize noise
-    latents = torch.randn(volume_with_gap.shape, generator=generator, device=device)
-
-    # Noise for original content
-    noise_for_known = torch.randn(volume_with_gap.shape, generator=generator, device=device)
-
+    # Main sampling loop
     with torch.no_grad():
-        for i, t in enumerate(tqdm(timesteps, desc="Inpainting", leave=False)):
-            # Ensure t is on correct device
-            t = t.to(device)
+        for i, t in enumerate(tqdm(timesteps, desc="Inpainting (DDPM)", leave=False)):
+            t_input = t.repeat(volume_with_gap.shape[0])  # Batch size
 
-            # Prepare masked image (known regions)
-            masked_image = volume_with_gap * (1.0 - mask)
+            # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
+            model_input = torch.cat([latents, mask, masked_images], dim=1)
 
-            # Scale model input
-            latent_model_input = local_scheduler.scale_model_input(latents, t)
-
-            # Concatenate for inpainting: [latents, mask, masked_image]
-            unet_input = torch.cat([latent_model_input, mask, masked_image], dim=1)
-
-            # Predict noise - ensure t is on correct device
-            t_tensor = t.repeat(volume_with_gap.shape[0]).to(device)
-            noise_pred = unet(unet_input, t_tensor, return_dict=False)[0]
+            # Predict noise
+            noise_pred = inpainting_unet(model_input, t_input).sample
 
             # Scheduler step
-            latents = local_scheduler.step(noise_pred, t, latents, generator=generator).prev_sample
+            step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
+            x_prev_denoised_candidate = step_output.prev_sample
 
-            # RePaint: replace known regions with properly noised original content
-            if i < len(timesteps) - 1:  # Not the last step
-                next_t = timesteps[i + 1].to(device)
-                # Add noise to original content - ensure next_t is on correct device
-                noised_original = local_scheduler.add_noise(volume_with_gap, noise_for_known, next_t.unsqueeze(0))
-                # Keep predicted for unknown (mask=1), replace with noised original for known (mask=0)
-                latents = latents * mask + noised_original * (1.0 - mask)
+            # RePaint-like guidance: ensure known regions stay consistent
+            if i < len(timesteps) - 1:
+                # Add noise to the original image for the next timestep
+                prev_t = timesteps[i + 1]
+                noise_for_gt_conditioning = torch.randn(
+                    volume_with_gap.shape, device=device, dtype=volume_with_gap.dtype
+                )
+
+                # Always use the original scheduler for adding noise (matches training)
+                x_prev_noised_known_gt = inpainting_scheduler.add_noise(
+                    volume_with_gap, noise_for_gt_conditioning, prev_t.unsqueeze(0)
+                )
+
+                # Composite: use inpainted prediction for masked areas, noisy GT for known areas
+                latents = x_prev_denoised_candidate * mask + x_prev_noised_known_gt * (1.0 - mask)
             else:
-                # Last step: use clean original for known regions
-                latents = latents * mask + volume_with_gap * (1.0 - mask)
+                # Last step: composite final x0 prediction
+                latents = x_prev_denoised_candidate * mask + volume_with_gap * (1.0 - mask)
 
+    print(f"Inpainting completed. Final shape: {latents.shape}")
     return latents
 
 
