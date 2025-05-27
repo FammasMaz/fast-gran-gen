@@ -44,6 +44,11 @@ class Trainer:
             except Exception as e:
                 print(f"Warning: Could not cache context samples: {e}")
 
+        # Initialize VTI storage variables
+        self.last_inpainted_vti = None
+        self.last_original_vti = None
+        self.last_masked_vti = None
+
         self.setup_training()
 
     def setup_training(self):
@@ -195,7 +200,11 @@ class Trainer:
 
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     self.log_reconstructions(epoch)
-                    self.generate_sample_images(epoch)
+                    inpainted_vti, original_vti, masked_vti = self.generate_sample_images(epoch)
+                    # Store the VTIs as instance variables for external access
+                    self.last_inpainted_vti = inpainted_vti
+                    self.last_original_vti = original_vti
+                    self.last_masked_vti = masked_vti
                     if not self.disable_telegram:
                         self.send_telegram_loss_update(epoch, train_loss, val_loss)
                         self.send_telegram_image_comparison(epoch)
@@ -674,7 +683,12 @@ class Trainer:
 
     def generate_sample_images(self, epoch):
         if not self.accelerator.is_main_process:
-            return
+            return None, None, None
+
+        # Initialize return variables to avoid UnboundLocalError
+        processed_volumes_01 = None
+        original_vti_processed = None
+        masked_vti_processed = None
 
         try:
             unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -878,6 +892,68 @@ class Trainer:
             images_5d_np = latents.cpu().float().numpy()
             #
 
+            # Process original and masked VTIs for return if inpainting mode
+            original_vti_processed = None
+            masked_vti_processed = None
+
+            if is_inpainting_unet and context_samples is not None and hasattr(self, "saved_gen_mask"):
+                # Process original VTI
+                original_5d_np = context_samples.cpu().float().numpy()
+                original_vti_processed = []
+
+                for i in range(original_5d_np.shape[0]):
+                    vol_norm = original_5d_np[i, 0]  # Take first channel -> (D, H, W)
+                    # Scale from [-1, 1] to [0, 1] for consistency
+                    vol_01 = (vol_norm + 1.0) / 2.0
+                    vol_01 = np.clip(vol_01, 0.0, 1.0)
+                    # Apply same processing as inpainted volumes
+                    vol_01_smooth = ndimage.gaussian_filter(vol_01, sigma=0.5)
+                    vol_binary = (vol_01_smooth > 0.5).astype(np.int32)
+
+                    # Apply same component filtering
+                    labeled_array, num_features = ndimage.label(vol_binary)
+                    component_sizes = np.bincount(labeled_array.ravel())
+                    min_size = int(0.01 * vol_binary.size)
+                    too_small = np.zeros(component_sizes.shape, bool)
+                    too_small[1:] = component_sizes[1:] < min_size
+
+                    vol_binary_clean = vol_binary.copy()
+                    for label in np.where(too_small)[0]:
+                        vol_binary_clean[labeled_array == label] = 0
+
+                    vol_01_final = vol_binary_clean.astype(np.float32)
+                    original_vti_processed.append(vol_01_final)
+
+                # Process masked VTI
+                mask_np = self.saved_gen_mask.cpu().numpy()
+                # Ensure mask is on the same device as context_samples
+                saved_gen_mask_device = self.saved_gen_mask.to(context_samples.device)
+                masked_5d_np = (context_samples * (1.0 - saved_gen_mask_device)).cpu().float().numpy()
+                masked_vti_processed = []
+
+                for i in range(masked_5d_np.shape[0]):
+                    vol_norm = masked_5d_np[i, 0]  # Take first channel -> (D, H, W)
+                    # Scale from [-1, 1] to [0, 1] for consistency
+                    vol_01 = (vol_norm + 1.0) / 2.0
+                    vol_01 = np.clip(vol_01, 0.0, 1.0)
+                    # Apply same processing as inpainted volumes
+                    vol_01_smooth = ndimage.gaussian_filter(vol_01, sigma=0.5)
+                    vol_binary = (vol_01_smooth > 0.5).astype(np.int32)
+
+                    # Apply same component filtering
+                    labeled_array, num_features = ndimage.label(vol_binary)
+                    component_sizes = np.bincount(labeled_array.ravel())
+                    min_size = int(0.01 * vol_binary.size)
+                    too_small = np.zeros(component_sizes.shape, bool)
+                    too_small[1:] = component_sizes[1:] < min_size
+
+                    vol_binary_clean = vol_binary.copy()
+                    for label in np.where(too_small)[0]:
+                        vol_binary_clean[labeled_array == label] = 0
+
+                    vol_01_final = vol_binary_clean.astype(np.float32)
+                    masked_vti_processed.append(vol_01_final)
+
             # Ensure C=1 for grayscale visualization/processing below
             if images_5d_np.shape[1] != 1:
                 print(f"Warning: Generated samples have {images_5d_np.shape[1]} channels. Processing assumes 1.")
@@ -932,6 +1008,8 @@ class Trainer:
                 temp_vtu_dir.mkdir(exist_ok=True)
 
                 saved_vtu_files = []
+
+                # Save inpainted VTIs
                 for i, volume_np_0_1 in enumerate(processed_volumes_01):
                     try:
                         # Get shape D, H, W from the numpy volume
@@ -943,7 +1021,7 @@ class Trainer:
                         grid.cell_data["values"] = np.ascontiguousarray(volume_np_0_1).flatten(order="C")
 
                         # Define temporary save path with .vti extension
-                        vti_filename = f"epoch_{epoch:04d}_sample_{i:02d}.vti"
+                        vti_filename = f"epoch_{epoch:04d}_sample_{i:02d}_inpainted.vti"
                         temp_vti_save_path = temp_vtu_dir / vti_filename
 
                         # Save the grid temporarily
@@ -952,7 +1030,53 @@ class Trainer:
 
                     except Exception as e:
                         # Update error message to mention VTI
-                        self.accelerator.print(f"Error saving temporary VTI file for epoch {epoch} sample {i}: {e}")
+                        self.accelerator.print(f"Error saving inpainted VTI file for epoch {epoch} sample {i}: {e}")
+
+                # Save original VTIs (if available)
+                if original_vti_processed is not None:
+                    for i, volume_np_0_1 in enumerate(original_vti_processed):
+                        try:
+                            # Get shape D, H, W from the numpy volume
+                            D, H, W = volume_np_0_1.shape
+                            grid = pv.ImageData()
+                            grid.dimensions = np.array([W, H, D]) + 1
+                            grid.origin = (0, 0, 0)
+                            grid.spacing = (1, 1, 1)
+                            grid.cell_data["values"] = np.ascontiguousarray(volume_np_0_1).flatten(order="C")
+
+                            # Define temporary save path with .vti extension
+                            vti_filename = f"epoch_{epoch:04d}_sample_{i:02d}_original.vti"
+                            temp_vti_save_path = temp_vtu_dir / vti_filename
+
+                            # Save the grid temporarily
+                            grid.save(str(temp_vti_save_path), binary=True)
+                            saved_vtu_files.append(str(temp_vti_save_path))
+
+                        except Exception as e:
+                            self.accelerator.print(f"Error saving original VTI file for epoch {epoch} sample {i}: {e}")
+
+                # Save masked VTIs (if available)
+                if masked_vti_processed is not None:
+                    for i, volume_np_0_1 in enumerate(masked_vti_processed):
+                        try:
+                            # Get shape D, H, W from the numpy volume
+                            D, H, W = volume_np_0_1.shape
+                            grid = pv.ImageData()
+                            grid.dimensions = np.array([W, H, D]) + 1
+                            grid.origin = (0, 0, 0)
+                            grid.spacing = (1, 1, 1)
+                            grid.cell_data["values"] = np.ascontiguousarray(volume_np_0_1).flatten(order="C")
+
+                            # Define temporary save path with .vti extension
+                            vti_filename = f"epoch_{epoch:04d}_sample_{i:02d}_masked.vti"
+                            temp_vti_save_path = temp_vtu_dir / vti_filename
+
+                            # Save the grid temporarily
+                            grid.save(str(temp_vti_save_path), binary=True)
+                            saved_vtu_files.append(str(temp_vti_save_path))
+
+                        except Exception as e:
+                            self.accelerator.print(f"Error saving masked VTI file for epoch {epoch} sample {i}: {e}")
 
                 # Compress the temporary VTI files into a single archive
                 if saved_vtu_files:  # Proceed only if some files were saved
@@ -1215,7 +1339,7 @@ class Trainer:
                         plt.close("all")  # Close any potentially open figures
                         fig = None  # Indicate no figure was created
                         buf = None
-                        return
+                        return processed_volumes_01, original_vti_processed, masked_vti_processed
 
                 buf = io.BytesIO()
                 plt.savefig(buf, format="png")
@@ -1243,6 +1367,10 @@ class Trainer:
             import traceback
 
             traceback.print_exc()
+
+        # Return the processed VTIs: (inpainted, original, masked)
+        # For non-inpainting modes, original and masked will be None
+        return processed_volumes_01, original_vti_processed, masked_vti_processed
 
 
 # Helper class for generating masks
