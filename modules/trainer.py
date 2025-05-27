@@ -1780,13 +1780,20 @@ class MaskGenerator3D:
                     strip_type = torch.randint(0, 3, (1,)).item()  # 0=depth, 1=height, 2=width
 
                     if strip_type == 0:  # Depth strips (most important for gap-filling)
-                        # Create 1-3 thin strips along depth axis
+                        # Create 1-3 thin strips along depth axis, avoiding edges for better gap-filling training
                         num_strips = torch.randint(1, 4, (1,)).item()
-                        strip_width = torch.randint(4, 16, (1,)).item()  # 4-16 voxels wide
+                        strip_width = torch.randint(8, 24, (1,)).item()  # 8-24 voxels wide (larger for gap-filling)
 
                         for _ in range(num_strips):
-                            if D > strip_width:
-                                start_pos = torch.randint(0, D - strip_width + 1, (1,)).item()
+                            if D > strip_width + 4:  # Ensure some margin from edges
+                                # Place strips more centrally, avoiding top 10% and bottom 10% of volume
+                                margin = max(2, D // 10)  # At least 2 voxels, or 10% of depth
+                                available_range = D - strip_width - 2 * margin
+                                if available_range > 0:
+                                    start_pos = margin + torch.randint(0, available_range + 1, (1,)).item()
+                                else:
+                                    # Fallback to original method if margins are too large
+                                    start_pos = torch.randint(0, D - strip_width + 1, (1,)).item()
                                 mask[b, :, start_pos : start_pos + strip_width, :, :] = 1
 
                     elif strip_type == 1:  # Height strips
