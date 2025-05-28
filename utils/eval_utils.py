@@ -257,16 +257,16 @@ def generate_single_volume(
     scheduler.set_timesteps(num_steps)
     unet.eval()
     with torch.no_grad():
-        for t in scheduler.timesteps.to(device):
+        for t in scheduler.timesteps:
             if mask is not None:
                 masked_input = torch.zeros_like(latents)
                 model_input = torch.cat([latents, mask, masked_input], dim=1)
             else:
                 model_input = latents
 
-            t_input = t.repeat(batch_size)
+            t_input = t.to(device).repeat(batch_size)
             noise_pred = unet(model_input, t_input, return_dict=False)[0]
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            latents = scheduler.step(noise_pred, t, latents, generator=base_generator).prev_sample
 
     for i in range(batch_size):
         volume_meets_criteria = False
