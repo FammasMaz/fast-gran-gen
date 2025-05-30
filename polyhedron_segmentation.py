@@ -17,11 +17,75 @@ import concurrent.futures
 import warnings
 
 
+def validate_mesh_coordinates(vertices: np.ndarray, label_id: int, max_reasonable_coord: float = 1e4) -> bool:
+    """
+    Aggressive coordinate validation using the same logic as the converter's outlier detection.
+
+    Args:
+        vertices: Vertex array to validate
+        label_id: Polyhedron ID for logging
+        max_reasonable_coord: Maximum reasonable coordinate value
+
+    Returns:
+        True if coordinates are valid, False if they should be filtered out
+    """
+    if vertices.size == 0:
+        return False
+
+    # Check for invalid coordinates (NaN, inf)
+    if np.any(~np.isfinite(vertices)):
+        print(f"WARNING: Polyhedron {label_id} has invalid coordinates (NaN/inf). Filtering out...")
+        return False
+
+    # Multiple cascading thresholds for aggressiveness
+    extreme_thresholds = [1e10, 1e8, 1e6, max_reasonable_coord]
+    max_coord = np.max(np.abs(vertices))
+
+    for threshold in extreme_thresholds:
+        if max_coord > threshold:
+            print(
+                f"WARNING: Polyhedron {label_id} has extreme coordinates (max: {max_coord:.2e} > {threshold:.2e}). Filtering out..."
+            )
+            return False
+
+    # Check for extreme aspect ratios
+    coord_ranges = np.max(vertices, axis=0) - np.min(vertices, axis=0)
+    if np.any(coord_ranges > 0):
+        non_zero_ranges = coord_ranges[coord_ranges > 0]
+        if len(non_zero_ranges) > 1:
+            max_range = np.max(non_zero_ranges)
+            min_range = np.min(non_zero_ranges)
+            aspect_ratio = max_range / min_range
+
+            if aspect_ratio > 1000:  # Aggressive threshold
+                print(
+                    f"WARNING: Polyhedron {label_id} has extreme aspect ratio ({aspect_ratio:.1f}). Filtering out..."
+                )
+                return False
+
+    return True
+
+
 # Helper function for multiprocessing
-def _global_mesh_task(segmentation_instance, labeled_grid, label_id, smoothing_iterations, decimation_ratio, use_sdf):
+def _global_mesh_task(
+    segmentation_instance,
+    labeled_grid,
+    label_id,
+    smoothing_iterations,
+    decimation_ratio,
+    use_sdf,
+    coordinate_sanity_check=True,
+    coordinate_validation_threshold=1e4,
+):
     polyhedron_size = np.sum(labeled_grid == label_id)
     mesh_data = segmentation_instance.extract_polyhedron_mesh(
-        labeled_grid, label_id, smoothing_iterations, decimation_ratio, use_sdf
+        labeled_grid,
+        label_id,
+        smoothing_iterations,
+        decimation_ratio,
+        use_sdf,
+        coordinate_sanity_check,
+        coordinate_validation_threshold,
     )
     return label_id, polyhedron_size, mesh_data
 
@@ -462,6 +526,8 @@ class PolyhedronSegmentation:
         smoothing_iterations: int = 10,
         decimation_ratio: float = 0.9,
         use_sdf: bool = True,
+        coordinate_sanity_check: bool = True,
+        max_reasonable_coord: float = 1e4,  # Keep this as the parameter name for consistency
     ) -> Dict:
         """
         Extract mesh (vertices and faces) for a specific labeled polyhedron using SDF.
@@ -472,6 +538,8 @@ class PolyhedronSegmentation:
             smoothing_iterations: Number of smoothing iterations to apply
             decimation_ratio: Ratio for mesh decimation (0-1, higher = more decimation)
             use_sdf: Whether to use SDF for better boundary detection
+            coordinate_sanity_check: Whether to validate coordinates for sanity
+            max_reasonable_coord: Maximum reasonable coordinate value for aggressive validation
 
         Returns:
             Dictionary with vertices and faces in global coordinates
@@ -506,17 +574,65 @@ class PolyhedronSegmentation:
         if mesh.n_points == 0 or mesh.n_cells == 0:
             return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0}
 
+        # AGGRESSIVE COORDINATE VALIDATION - Check immediately after mesh creation
+        if coordinate_sanity_check:
+            if not validate_mesh_coordinates(mesh.points, label_id, max_reasonable_coord):
+                return {
+                    "vertices": [],
+                    "faces": [],
+                    "volume": 0,
+                    "n_vertices": 0,
+                    "n_faces": 0,
+                    "skipped_reason": "failed_initial_coordinate_validation",
+                }
+
         # Apply smoothing to reduce voxel artifacts
         if smoothing_iterations > 0:
             mesh = mesh.smooth(n_iter=smoothing_iterations, relaxation_factor=0.1)
+
+            # Re-check coordinates after smoothing
+            if coordinate_sanity_check:
+                if not validate_mesh_coordinates(mesh.points, label_id, max_reasonable_coord):
+                    return {
+                        "vertices": [],
+                        "faces": [],
+                        "volume": 0,
+                        "n_vertices": 0,
+                        "n_faces": 0,
+                        "skipped_reason": "failed_post_smoothing_validation",
+                    }
 
         # Apply decimation to reduce polygon count
         if 0 < decimation_ratio < 1:
             target_reduction = decimation_ratio
             mesh = mesh.decimate(target_reduction)
 
+            # Re-check coordinates after decimation
+            if coordinate_sanity_check:
+                if not validate_mesh_coordinates(mesh.points, label_id, max_reasonable_coord):
+                    return {
+                        "vertices": [],
+                        "faces": [],
+                        "volume": 0,
+                        "n_vertices": 0,
+                        "n_faces": 0,
+                        "skipped_reason": "failed_post_decimation_validation",
+                    }
+
         if mesh.n_points == 0 or mesh.n_cells == 0:  # Check again after processing
             return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0}
+
+        # Final coordinate validation before returning
+        if coordinate_sanity_check:
+            if not validate_mesh_coordinates(mesh.points, label_id, max_reasonable_coord):
+                return {
+                    "vertices": [],
+                    "faces": [],
+                    "volume": 0,
+                    "n_vertices": 0,
+                    "n_faces": 0,
+                    "skipped_reason": "failed_final_validation",
+                }
 
         # Extract vertices and faces
         vertices = mesh.points
@@ -533,12 +649,19 @@ class PolyhedronSegmentation:
         # Calculate volume
         volume = mesh.volume if hasattr(mesh, "volume") else 0
 
+        # Calculate coordinate ranges
+        coord_ranges = np.zeros(3)
+        if vertices.shape[0] > 0:
+            coord_ranges = np.max(vertices, axis=0) - np.min(vertices, axis=0)
+
         return {
             "vertices": vertices.tolist(),
             "faces": faces_list,
             "volume": volume,
-            "n_vertices": mesh.n_points,  # Use mesh.n_points
-            "n_faces": mesh.n_cells,  # Changed from mesh.n_faces to mesh.n_cells
+            "n_vertices": mesh.n_points,
+            "n_faces": mesh.n_cells,
+            "ranges": coord_ranges.tolist(),
+            "label_id": label_id,
         }
 
     def process_voxel_grid(
@@ -564,6 +687,11 @@ class PolyhedronSegmentation:
         use_sdf: bool = True,
         remove_boundary_polyhedrons: bool = True,
         max_voxel_aspect_ratio: Optional[float] = 20.0,
+        coordinate_validation_threshold: float = 1e4,  # New parameter
+        # New parameters for mesh range outlier filter
+        enable_mesh_range_outlier_filter: bool = True,
+        mesh_range_outlier_iqr_factor: float = 1.5,
+        mesh_range_outlier_median_factor: float = 100.0,
         **other_kwargs,  # Catch any other unexpected kwargs
     ) -> Dict:
         """
@@ -588,7 +716,11 @@ class PolyhedronSegmentation:
             use_sdf: Whether to use SDF for mesh extraction
             remove_boundary_polyhedrons: Whether to remove polyhedrons touching the grid boundary
             max_voxel_aspect_ratio: Maximum aspect ratio of voxel bounding box to keep a polyhedron (e.g., 20). Longest_side / shortest_side. Set to 0 or None to disable.
+            coordinate_validation_threshold: Maximum reasonable coordinate value for aggressive validation
             other_kwargs: For any other potential future arguments
+            enable_mesh_range_outlier_filter: Whether to enable the mesh range outlier filter.
+            mesh_range_outlier_iqr_factor: IQR factor for mesh range outlier detection.
+            mesh_range_outlier_median_factor: Median factor for mesh range outlier detection.
 
         Returns:
             Dictionary containing all extracted polyhedrons
@@ -724,72 +856,172 @@ class PolyhedronSegmentation:
         # Step 4: Extract individual polyhedrons
         print(f"Extracting {len(label_ids_to_process)} polyhedrons...")
 
-        if num_workers > 1 and len(label_ids_to_process) > 1:  # Check if there are labels to process in parallel
+        candidate_polyhedron_mesh_data_list = []  # Store (label_id, polyhedron_size, mesh_data)
+
+        if num_workers > 1 and len(label_ids_to_process) > 1:
             print(f"Using {num_workers} parallel workers for mesh extraction...")
-            # Ensure self can be pickled for multiprocessing if methods are directly passed
             with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
                 futures = [
                     executor.submit(
                         _global_mesh_task,
-                        self,  # Pass the instance
+                        self,
                         labeled_grid,
                         label_id,
                         smoothing_iterations,
                         decimation_ratio,
-                        use_sdf,  # Pass mesh extraction use_sdf
+                        use_sdf,
+                        True,  # coordinate_sanity_check
+                        coordinate_validation_threshold,
                     )
-                    for label_id in label_ids_to_process  # Use filtered list
+                    for label_id in label_ids_to_process
                 ]
                 for future in tqdm(
                     concurrent.futures.as_completed(futures),
-                    total=len(label_ids_to_process),  # Use filtered list
+                    total=len(label_ids_to_process),
                     desc="Extracting polyhedrons (parallel)",
                 ):
                     try:
-                        label_id, polyhedron_size, mesh_data = future.result()
-                        if mesh_data and len(mesh_data.get("vertices", [])) > 0:
-                            polyhedrons[str(label_id)] = {
-                                "id": label_id,
-                                "vertices": mesh_data["vertices"],
-                                "faces": mesh_data["faces"],
-                                "volume": mesh_data.get("volume", 0),
-                                "n_vertices": mesh_data.get("n_vertices", 0),
-                                "n_faces": mesh_data.get("n_faces", 0),
-                                "voxel_count": int(polyhedron_size),
-                                "centroid": self._calculate_centroid(mesh_data["vertices"]),
-                                "bounding_box": self._calculate_bounding_box(mesh_data["vertices"]),
-                            }
+                        label_id, polyhedron_size, mesh_data_item = future.result()
+                        if mesh_data_item and len(mesh_data_item.get("vertices", [])) > 0:
+                            # mesh_data_item already contains label_id from the modified extract_polyhedron_mesh
+                            candidate_polyhedron_mesh_data_list.append(
+                                {"polyhedron_size": polyhedron_size, **mesh_data_item}
+                            )
                     except Exception as e:
-                        print(
-                            f"Error processing future for label {label_id if 'label_id' in locals() else 'unknown'}: {e}"
-                        )
+                        processed_label_id = "unknown"
+                        # Attempt to get label_id from future if possible, though it's tricky
+                        # This part is heuristical as direct access to submitted args isn't straightforward post-submission
+                        print(f"Error processing future for a label: {e}")
 
         else:
             if num_workers > 1:
                 print("Not enough labels or workers for parallel processing, using sequential.")
-            for label_id in tqdm(
-                label_ids_to_process, desc="Extracting polyhedrons (sequential)"
-            ):  # Use filtered list
-                polyhedron_size = np.sum(labeled_grid == label_id)
-                mesh_data = self.extract_polyhedron_mesh(
+            for label_id in tqdm(label_ids_to_process, desc="Extracting polyhedrons (sequential)"):
+                polyhedron_size = np.sum(labeled_grid == label_id)  # Calculate size here for consistency
+                mesh_data_item = self.extract_polyhedron_mesh(
                     labeled_grid,
                     label_id,
                     smoothing_iterations,
                     decimation_ratio,
-                    use_sdf,  # Pass mesh extraction use_sdf
+                    use_sdf,
+                    True,  # coordinate_sanity_check
+                    coordinate_validation_threshold,  # use the renamed parameter here
                 )
-                if mesh_data and len(mesh_data.get("vertices", [])) > 0:
-                    polyhedrons[str(label_id)] = {
-                        "id": label_id,
-                        "vertices": mesh_data["vertices"],
-                        "faces": mesh_data["faces"],
-                        "volume": mesh_data.get("volume", 0),
-                        "n_vertices": mesh_data.get("n_vertices", 0),
-                        "n_faces": mesh_data.get("n_faces", 0),
-                        "voxel_count": int(polyhedron_size),
-                        "centroid": self._calculate_centroid(mesh_data["vertices"]),
-                        "bounding_box": self._calculate_bounding_box(mesh_data["vertices"]),
-                    }
+                if mesh_data_item and len(mesh_data_item.get("vertices", [])) > 0:
+                    candidate_polyhedron_mesh_data_list.append({"polyhedron_size": polyhedron_size, **mesh_data_item})
+
+        print(f"  Collected {len(candidate_polyhedron_mesh_data_list)} candidate meshes after initial extraction.")
+
+        # Step 5: Global Mesh Range Outlier Filter
+        final_polyhedrons_list = []
+        if enable_mesh_range_outlier_filter and candidate_polyhedron_mesh_data_list:
+            print(
+                f"Applying global mesh range outlier filter (IQR factor: {mesh_range_outlier_iqr_factor}, Median factor: {mesh_range_outlier_median_factor})..."
+            )
+            all_mesh_ranges_stats = {"x": [], "y": [], "z": []}
+            for data in candidate_polyhedron_mesh_data_list:
+                ranges = data.get("ranges")
+                if ranges and len(ranges) == 3:
+                    all_mesh_ranges_stats["x"].append(ranges[0])
+                    all_mesh_ranges_stats["y"].append(ranges[1])
+                    all_mesh_ranges_stats["z"].append(ranges[2])
+
+            axis_final_thresholds = {}
+            for i, axis_name in enumerate(["x", "y", "z"]):
+                ranges_for_axis = all_mesh_ranges_stats[axis_name]
+                if not ranges_for_axis:
+                    axis_final_thresholds[axis_name] = float("inf")  # No filter if no data for this axis
+                    print(f"    No range data for axis {axis_name}, effectively disabling filter for it.")
+                    continue
+
+                q75 = np.percentile(ranges_for_axis, 75)
+                q25 = np.percentile(ranges_for_axis, 25)
+                iqr = q75 - q25
+
+                # Handle cases where iqr is zero (e.g. all ranges are the same)
+                # If iqr is 0, upper_bound might become q75, which could be too restrictive if all values are identical.
+                # A small epsilon or alternative handling might be needed if iqr is very small or zero.
+                # For now, if iqr is 0, the iqr_component of the threshold will be 0, relying on median part.
+                # Or, if all values are same, iqr is 0, median is that value. abs_threshold = val * factor. upper_bound = val.
+                # So final_threshold = val. This would filter all if factor > 1.
+                # Let's ensure iqr is not negative (can happen with percentiles in weird data, though unlikely here)
+                iqr = max(iqr, 0)
+
+                upper_bound_iqr = q75 + mesh_range_outlier_iqr_factor * iqr
+
+                median_val = np.median(ranges_for_axis)
+                # Handle cases where median_val is zero to avoid threshold of 0
+                if (
+                    median_val == 0 and mesh_range_outlier_median_factor > 0
+                ):  # if median is 0, this threshold is 0, which is too aggressive
+                    # If median is 0, but other values exist, this factor might be too aggressive.
+                    # Fallback for zero median: use mean or a small fraction of max range?
+                    # Or simply rely on IQR part if median is 0.
+                    # For now, if median is 0, this threshold part becomes 0.
+                    # Let's set abs_threshold_median to infinity if median is 0 to effectively disable it
+                    # unless ranges_for_axis contains only zeros.
+                    if np.all(np.array(ranges_for_axis) == 0):
+                        abs_threshold_median = 0  # All ranges are 0, so threshold is 0.
+                    else:  # Median is 0, but other non-zero ranges exist
+                        abs_threshold_median = float(
+                            "inf"
+                        )  # Effectively disable median part if median is 0 but not all ranges are 0
+                        print(
+                            f"    Median for axis {axis_name} is 0, but non-zero ranges exist. Median factor threshold disabled for this axis."
+                        )
+                else:
+                    abs_threshold_median = median_val * mesh_range_outlier_median_factor
+
+                current_axis_threshold = min(upper_bound_iqr, abs_threshold_median)
+                axis_final_thresholds[axis_name] = current_axis_threshold
+                print(
+                    f"    Axis {axis_name}: Q25={q25:.2e}, Q75={q75:.2e}, IQR={iqr:.2e}, IQR_thresh={upper_bound_iqr:.2e}, Med_thresh={abs_threshold_median:.2e} => Final Threshold={current_axis_threshold:.2e}"
+                )
+
+            range_outlier_removed_count = 0
+            for poly_data in candidate_polyhedron_mesh_data_list:
+                current_poly_ranges = poly_data.get("ranges")
+                poly_label_id = poly_data.get("label_id", "Unknown")  # Get label_id for logging
+                is_outlier = False
+                if current_poly_ranges and len(current_poly_ranges) == 3:
+                    for i, axis_name in enumerate(["x", "y", "z"]):
+                        if current_poly_ranges[i] > axis_final_thresholds[axis_name]:
+                            print(
+                                f"    Filtering out polyhedron {poly_label_id} due to range outlier on axis {axis_name}: {current_poly_ranges[i]:.2e} > {axis_final_thresholds[axis_name]:.2e}"
+                            )
+                            is_outlier = True
+                            range_outlier_removed_count += 1
+                            break
+
+                if not is_outlier:
+                    final_polyhedrons_list.append(poly_data)
+            print(f"  Removed {range_outlier_removed_count} polyhedrons due to global mesh range outlier filter.")
+        else:
+            final_polyhedrons_list = candidate_polyhedron_mesh_data_list
+            if not enable_mesh_range_outlier_filter:
+                print("  Global mesh range outlier filter is disabled.")
+            elif not candidate_polyhedron_mesh_data_list:
+                print("  No candidate meshes to apply global mesh range outlier filter.")
+
+        # Populate the final polyhedrons dictionary
+        polyhedrons = {}
+        for poly_data_item in final_polyhedrons_list:
+            label_id = poly_data_item["label_id"]
+            polyhedrons[str(label_id)] = {
+                "id": label_id,
+                "vertices": poly_data_item["vertices"],
+                "faces": poly_data_item["faces"],
+                "volume": poly_data_item.get("volume", 0),
+                "n_vertices": poly_data_item.get("n_vertices", 0),
+                "n_faces": poly_data_item.get("n_faces", 0),
+                "voxel_count": int(poly_data_item.get("polyhedron_size", 0)),  # Make sure polyhedron_size is available
+                "centroid": self._calculate_centroid(poly_data_item["vertices"]),
+                "bounding_box": self._calculate_bounding_box(poly_data_item["vertices"]),
+                "ranges": poly_data_item.get("ranges"),  # Keep ranges in the final output
+            }
+
+        total_final_polyhedrons = len(polyhedrons)
+        print(f"Total polyhedrons extracted after all filters: {total_final_polyhedrons}")
 
         # Metadata
         metadata = {
@@ -815,6 +1047,10 @@ class PolyhedronSegmentation:
                 "use_sdf_mesh_extraction": use_sdf,
                 "remove_boundary_polyhedrons": remove_boundary_polyhedrons,
                 "max_voxel_aspect_ratio": max_voxel_aspect_ratio,
+                "coordinate_validation_threshold": coordinate_validation_threshold,
+                "enable_mesh_range_outlier_filter": enable_mesh_range_outlier_filter,
+                "mesh_range_outlier_iqr_factor": mesh_range_outlier_iqr_factor,
+                "mesh_range_outlier_median_factor": mesh_range_outlier_median_factor,
             },
         }
         if segmentation_method == "watershed_sdf":
@@ -1142,7 +1378,7 @@ def main():
     parser.add_argument(
         "--remove-small-objects",
         type=int,
-        default=50,
+        default=10,
         help="Remove objects smaller than this many voxels post-binarization",
     )
 
@@ -1235,24 +1471,46 @@ def main():
     parser.add_argument(
         "--remove-boundary-polyhedrons",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Remove polyhedrons that touch the voxel grid boundary (default: True)",
+        default=True,  # Changed to True for consistency
+        help="Remove polyhedrons that touch the voxel grid boundary (default: True). Use --no-remove-boundary-polyhedrons to keep them.",
     )
 
     parser.add_argument(
         "--max-voxel-aspect-ratio",
         type=float,
-        default=20.0,  # Default value, e.g. 20. Set to 0 to disable.
-        help="Maximum aspect ratio of a polyhedron's voxel bounding box (longest_side/shortest_side) to keep it. Set to 0 to disable. (default: 20.0)",
+        default=20.0,  # Default from process_voxel_grid
+        help="Filter polyhedrons by max voxel aspect ratio (0 or negative to disable). E.g., 20 means longest_side/shortest_side <= 20.",
+    )
+    parser.add_argument(
+        "--coordinate-validation-threshold",
+        type=float,
+        default=1e4,  # Default from process_voxel_grid
+        help="Max reasonable coordinate value for aggressive validation during mesh extraction (e.g., 1e4).",
+    )
+
+    # New CLI args for mesh range outlier filter
+    parser.add_argument(
+        "--enable-mesh-range-outlier-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the global mesh range outlier filter (default: True).",
+    )
+    parser.add_argument(
+        "--mesh-range-outlier-iqr-factor",
+        type=float,
+        default=1.5,
+        help="IQR factor for mesh range outlier detection (default: 1.5).",
+    )
+    parser.add_argument(
+        "--mesh-range-outlier-median-factor",
+        type=float,
+        default=100.0,
+        help="Median factor for mesh range outlier detection (default: 100.0).",
     )
 
     parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=os.cpu_count() // 2 or 1,  # Sensible default
-        help="Number of parallel workers for mesh extraction",
+        "--num-workers", type=int, default=os.cpu_count(), help="Number of parallel workers for mesh extraction"
     )
-
     args = parser.parse_args()
 
     # Initialize segmentation
@@ -1291,6 +1549,11 @@ def main():
         use_sdf=args.use_sdf_mesh,  # Passed to process_voxel_grid
         remove_boundary_polyhedrons=args.remove_boundary_polyhedrons,
         max_voxel_aspect_ratio=args.max_voxel_aspect_ratio,
+        coordinate_validation_threshold=args.coordinate_validation_threshold,
+        # Pass new mesh range outlier filter parameters
+        enable_mesh_range_outlier_filter=args.enable_mesh_range_outlier_filter,
+        mesh_range_outlier_iqr_factor=args.mesh_range_outlier_iqr_factor,
+        mesh_range_outlier_median_factor=args.mesh_range_outlier_median_factor,
     )
 
     processing_time = time.time() - start_time
@@ -1326,14 +1589,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Make sure to handle potential issues with multiprocessing in spawned processes,
-    # especially if using PyVista or other GUI/OpenGL libraries in ways not friendly to fork/spawn.
-    # The _global_mesh_task is a top-level function which helps.
-    # Consider `if __name__ == "__main__":` for PyVista imports if they cause issues on module load for spawned workers.
-    # However, current imports are at the top level.
-
-    # For PyVista and multiprocessing on some systems (like Windows or macOS with 'spawn'),
-    # it might be necessary to ensure that PyVista is not initialized in the global scope
-    # in a way that interferes with child processes. Usually, plotter instances are created
-    # and used within functions, which is safer.
     main()
