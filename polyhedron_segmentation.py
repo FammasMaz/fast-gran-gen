@@ -2017,8 +2017,11 @@ class PolyhedronSegmentation:
         label_values = labeled_grid[target_mask]
 
         # Group coordinates by label
+        print("Grouping coordinates by polyhedron labels...")
         coord_groups = {}
-        for coord, label in zip(coords, label_values):
+        for coord, label in tqdm(
+            zip(coords, label_values), desc="Grouping coordinates", total=len(coords), unit="voxels"
+        ):
             if label not in coord_groups:
                 coord_groups[label] = []
             coord_groups[label].append(coord)
@@ -2564,9 +2567,11 @@ class PolyhedronSegmentation:
         }
 
         # Step 1: Preprocess
+        print("Step 1/4: Preprocessing voxel grid...")
         binary_grid = self.preprocess_voxel_grid(voxel_grid, **preprocess_params)
 
         # Step 2: Segment
+        print("Step 2/4: Segmenting polyhedrons...")
         labeled_grid, num_labels = self.segment_polyhedrons(binary_grid, method=segmentation_method, **segment_params)
 
         if num_labels == 0:
@@ -2574,13 +2579,15 @@ class PolyhedronSegmentation:
             return {"polyhedrons": {}, "metadata": {"total_count": 0, "boundary_removed_count": 0}}
 
         # Step 3: Filter polyhedrons by size and optionally remove boundary polyhedrons
-        print(f"\nInitial labels found: {num_labels}")
+        print("Step 3/4: Filtering polyhedrons...")
+        print(f"Initial labels found: {num_labels}")
         polyhedrons = {}
 
         # First, filter by minimum size
+        print("  - Filtering by minimum size...")
         candidate_label_ids = [
             label_id
-            for label_id in range(1, num_labels + 1)
+            for label_id in tqdm(range(1, num_labels + 1), desc="Size filtering", unit="polyhedrons")
             if np.sum(labeled_grid == label_id) >= min_polyhedron_size
         ]
         print(
@@ -2595,7 +2602,7 @@ class PolyhedronSegmentation:
             f"DEBUG: Checking boundary removal. remove_boundary_polyhedrons={remove_boundary_polyhedrons}, len(label_ids_to_process)={len(label_ids_to_process)}"
         )
         if remove_boundary_polyhedrons and len(label_ids_to_process) > 0:
-            print("Identifying and removing polyhedrons touching the grid boundary...")
+            print("  - Identifying and removing boundary polyhedrons...")
             boundary_labels = set()
             dims = labeled_grid.shape
             # Z boundaries
@@ -2613,7 +2620,7 @@ class PolyhedronSegmentation:
 
             initial_count_before_boundary_filter = len(label_ids_to_process)
             temp_label_ids_after_boundary = []
-            for label_id in label_ids_to_process:
+            for label_id in tqdm(label_ids_to_process, desc="Boundary filtering", unit="polyhedrons"):
                 if label_id not in boundary_labels:
                     temp_label_ids_after_boundary.append(label_id)
                 else:
@@ -2628,10 +2635,10 @@ class PolyhedronSegmentation:
 
         # Aspect Ratio Filtering (new step)
         if max_voxel_aspect_ratio is not None and max_voxel_aspect_ratio > 0 and len(label_ids_to_process) > 0:
-            print(f"Filtering polyhedrons by max voxel aspect ratio ({max_voxel_aspect_ratio})...")
+            print(f"  - Filtering by max voxel aspect ratio ({max_voxel_aspect_ratio})...")
             initial_count_before_aspect_filter = len(label_ids_to_process)
             label_ids_after_aspect_ratio_filter = []
-            for label_id in label_ids_to_process:
+            for label_id in tqdm(label_ids_to_process, desc="Aspect ratio filtering", unit="polyhedrons"):
                 coords = np.argwhere(labeled_grid == label_id)
                 if coords.shape[0] < 2:
                     label_ids_after_aspect_ratio_filter.append(label_id)
@@ -2667,7 +2674,7 @@ class PolyhedronSegmentation:
             }
 
         # Step 4: Extract individual polyhedrons
-        print(f"Extracting {len(label_ids_to_process)} polyhedrons...")
+        print(f"Step 4/4: Extracting {len(label_ids_to_process)} polyhedrons...")
         if fast_mesh_extraction:
             print(
                 f"Using fast mesh extraction (batch_size={batch_mesh_size}, skip_sdf_for_small={skip_sdf_for_small})"
