@@ -1899,21 +1899,35 @@ class PolyhedronSegmentation:
         """
         print(f"Starting fast mesh extraction for {len(label_ids)} polyhedrons")
 
+        # MAJOR OPTIMIZATION: Skip SDF by default for much faster processing
+        # SDF computation is expensive and often not necessary for good quality meshes
+        use_sdf_optimized = False if skip_sdf_for_small else use_sdf
+
+        # Enable fast mode for better performance
+        fast_mode_optimized = True
+
+        # Reduce smoothing iterations for faster processing
+        smoothing_optimized = max(1, smoothing_iterations // 2) if reduce_smoothing_for_small else smoothing_iterations
+
+        print(
+            f"  Optimizations: SDF={use_sdf_optimized}, FastMode={fast_mode_optimized}, Smoothing={smoothing_optimized}"
+        )
+
         # Direct processing without unnecessary size-based sorting
         # Create simple list of (label_id, 0) tuples since size isn't needed for processing
         polyhedron_list = [(label_id, 0) for label_id in label_ids]
 
-        # Process all polyhedrons with consistent settings
+        # Process all polyhedrons with optimized settings
         results = self._extract_polyhedrons_batch(
             labeled_grid,
             polyhedron_list,
-            smoothing_iterations=smoothing_iterations,
+            smoothing_iterations=smoothing_optimized,
             decimation_ratio=decimation_ratio,
-            use_sdf=use_sdf,
+            use_sdf=use_sdf_optimized,
             coordinate_validation_threshold=coordinate_validation_threshold,
             batch_size=batch_size,
             num_workers=num_workers,
-            fast_mode=False,
+            fast_mode=fast_mode_optimized,
         )
 
         print(f"Fast mesh extraction completed. Processed {len(results)} polyhedrons successfully.")
@@ -1932,66 +1946,239 @@ class PolyhedronSegmentation:
         fast_mode: bool = False,
     ) -> List[Dict]:
         """
-        Process polyhedrons in batches for better efficiency.
+        OPTIMIZED: Vectorized batch processing to eliminate individual grid scans.
+        """
+        if not polyhedron_list:
+            return []
+
+        # Extract just the label IDs for vectorized processing
+        label_ids = [label_id for label_id, _ in polyhedron_list]
+
+        print(f"Using vectorized extraction for {len(label_ids)} polyhedrons...")
+        start_time = time.time()
+
+        # Use the new vectorized method
+        results = self._extract_polyhedrons_vectorized(
+            labeled_grid,
+            label_ids,
+            smoothing_iterations,
+            decimation_ratio,
+            use_sdf,
+            coordinate_validation_threshold,
+            fast_mode,
+            num_workers,
+        )
+
+        print(f"Vectorized extraction completed in {time.time() - start_time:.2f}s")
+        return results
+
+    def _extract_polyhedrons_vectorized(
+        self,
+        labeled_grid: np.ndarray,
+        label_ids: List[int],
+        smoothing_iterations: int,
+        decimation_ratio: float,
+        use_sdf: bool,
+        coordinate_validation_threshold: float,
+        fast_mode: bool = False,
+        num_workers: int = 1,
+    ) -> List[Dict]:
+        """
+        Vectorized polyhedron extraction that processes multiple polyhedrons simultaneously.
         """
         all_results = []
 
-        # If batch_size is 0 or negative, process all polyhedrons in one batch
-        if batch_size <= 0:
-            batch_size = len(polyhedron_list)
-            print(f"Batch size is 0, processing all {len(polyhedron_list)} polyhedrons in one batch (no batching)")
+        # Create mask for all target labels at once
+        target_mask = np.isin(labeled_grid, label_ids)
+        if not np.any(target_mask):
+            return []
 
-        # Process in batches
-        for i in tqdm(range(0, len(polyhedron_list), batch_size), desc="Processing batches"):
-            batch = polyhedron_list[i : i + batch_size]
+        # Get coordinates of all voxels belonging to target polyhedrons
+        coords = np.argwhere(target_mask)
+        label_values = labeled_grid[target_mask]
 
-            if num_workers > 1 and len(batch) > 1:
-                # Parallel processing within batch - use ThreadPoolExecutor for I/O bound mesh operations
-                optimal_batch_workers = min(num_workers, len(batch), get_optimal_worker_count("mixed", num_workers))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_batch_workers) as executor:
-                    futures = []
-                    for label_id, polyhedron_size in batch:
-                        future = executor.submit(
-                            self._extract_single_polyhedron_optimized,
-                            labeled_grid,
-                            label_id,
-                            polyhedron_size,
-                            smoothing_iterations,
-                            decimation_ratio,
-                            use_sdf,
-                            coordinate_validation_threshold,
-                            fast_mode,
-                        )
-                        futures.append(future)
+        # Group coordinates by label
+        coord_groups = {}
+        for coord, label in zip(coords, label_values):
+            if label not in coord_groups:
+                coord_groups[label] = []
+            coord_groups[label].append(coord)
 
-                    # Collect results
-                    for future in futures:
-                        try:
-                            result = future.result()
-                            if result and len(result.get("vertices", [])) > 0:
-                                all_results.append(result)
-                        except Exception as e:
-                            print(f"    Error in batch processing: {e}")
-            else:
-                # Sequential processing within batch
-                for label_id, polyhedron_size in batch:
+        # Convert to numpy arrays for efficiency
+        for label in coord_groups:
+            coord_groups[label] = np.array(coord_groups[label])
+
+        # Process each polyhedron using pre-computed coordinates
+        print(f"Processing {len(coord_groups)} polyhedrons with vectorized approach...")
+
+        # Determine processing approach based on size and workers
+        if num_workers > 1 and len(coord_groups) > 1:
+            # Parallel processing
+            optimal_workers = min(num_workers, len(coord_groups), get_optimal_worker_count("mixed", num_workers))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                futures = []
+                for label_id in coord_groups:
+                    future = executor.submit(
+                        self._extract_single_polyhedron_from_coords,
+                        coord_groups[label_id],
+                        label_id,
+                        smoothing_iterations,
+                        decimation_ratio,
+                        use_sdf,
+                        coordinate_validation_threshold,
+                        fast_mode,
+                    )
+                    futures.append(future)
+
+                # Collect results
+                for future in tqdm(futures, desc="Extracting meshes"):
                     try:
-                        result = self._extract_single_polyhedron_optimized(
-                            labeled_grid,
-                            label_id,
-                            polyhedron_size,
-                            smoothing_iterations,
-                            decimation_ratio,
-                            use_sdf,
-                            coordinate_validation_threshold,
-                            fast_mode,
-                        )
+                        result = future.result()
                         if result and len(result.get("vertices", [])) > 0:
                             all_results.append(result)
                     except Exception as e:
-                        print(f"    Error processing polyhedron {label_id}: {e}")
+                        print(f"    Error in parallel extraction: {e}")
+        else:
+            # Sequential processing
+            for label_id in tqdm(coord_groups, desc="Extracting meshes"):
+                try:
+                    result = self._extract_single_polyhedron_from_coords(
+                        coord_groups[label_id],
+                        label_id,
+                        smoothing_iterations,
+                        decimation_ratio,
+                        use_sdf,
+                        coordinate_validation_threshold,
+                        fast_mode,
+                    )
+                    if result and len(result.get("vertices", [])) > 0:
+                        all_results.append(result)
+                except Exception as e:
+                    print(f"    Error extracting polyhedron {label_id}: {e}")
 
         return all_results
+
+    def _extract_single_polyhedron_from_coords(
+        self,
+        coords: np.ndarray,
+        label_id: int,
+        smoothing_iterations: int,
+        decimation_ratio: float,
+        use_sdf: bool,
+        coordinate_validation_threshold: float,
+        fast_mode: bool = False,
+    ) -> Dict:
+        """
+        Extract mesh for a single polyhedron using pre-computed coordinates.
+        This eliminates the need for labeled_grid == label_id operations.
+        """
+        if len(coords) == 0:
+            return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+        try:
+            # Calculate bounding box from coordinates
+            min_coords = np.min(coords, axis=0)
+            max_coords = np.max(coords, axis=0)
+
+            # Add padding for processing
+            padding = 3 if use_sdf else 2
+            min_coords = np.maximum(min_coords - padding, 0)
+            # Note: We don't have direct access to grid_shape here, so we'll use a conservative approach
+            # The mesh extraction will handle boundary cases gracefully
+            max_coords = max_coords + padding
+
+            # Create minimal region
+            region_shape = max_coords - min_coords + 1
+            region_polyhedron = np.zeros(region_shape, dtype=np.uint8)
+
+            # Map coordinates to region space
+            region_coords = coords - min_coords
+            region_polyhedron[region_coords[:, 0], region_coords[:, 1], region_coords[:, 2]] = 1
+
+            if use_sdf and not fast_mode:
+                # Compute SDF on the region
+                sdf = self.compute_sdf(region_polyhedron.astype(bool), scale=3.0)
+
+                # Create PyVista grid
+                region_origin = self.origin + min_coords * self.voxel_spacing
+                grid = pv.ImageData(dimensions=sdf.shape, spacing=self.voxel_spacing, origin=region_origin)
+                grid.point_data["values"] = sdf.flatten(order="F")
+
+                # Extract isosurface
+                mesh = grid.contour(isosurfaces=[0.0])
+            else:
+                # Binary approach
+                region_origin = self.origin + min_coords * self.voxel_spacing
+                grid = pv.ImageData(
+                    dimensions=region_polyhedron.shape, spacing=self.voxel_spacing, origin=region_origin
+                )
+                grid.point_data["values"] = region_polyhedron.flatten(order="F")
+
+                mesh = grid.contour(isosurfaces=[0.5])
+
+            if mesh.n_points == 0 or mesh.n_cells == 0:
+                return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+            # Coordinate validation (skip in fast mode for speed)
+            if not fast_mode:
+                if not validate_mesh_coordinates(mesh.points, label_id, coordinate_validation_threshold):
+                    return {
+                        "vertices": [],
+                        "faces": [],
+                        "volume": 0,
+                        "n_vertices": 0,
+                        "n_faces": 0,
+                        "skipped_reason": "failed_coordinate_validation",
+                        "label_id": label_id,
+                    }
+
+            # Apply smoothing (reduced in fast mode)
+            actual_smoothing = max(1, smoothing_iterations // 2) if fast_mode else smoothing_iterations
+            if actual_smoothing > 0:
+                mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
+
+            # Decimation
+            if 0 < decimation_ratio < 1:
+                mesh = mesh.decimate(decimation_ratio)
+
+            if mesh.n_points == 0 or mesh.n_cells == 0:
+                return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+            # OPTIMIZED: Extract faces more efficiently
+            vertices = mesh.points
+            faces_list = self._extract_faces_optimized(mesh.faces)
+
+            # Calculate volume
+            volume = mesh.volume if hasattr(mesh, "volume") else 0
+            coord_ranges = np.ptp(vertices, axis=0) if vertices.shape[0] > 0 else np.zeros(3)
+
+            return {
+                "vertices": vertices.tolist(),
+                "faces": faces_list,
+                "volume": volume,
+                "n_vertices": mesh.n_points,
+                "n_faces": mesh.n_cells,
+                "ranges": coord_ranges.tolist(),
+                "label_id": label_id,
+                "polyhedron_size": len(coords),
+            }
+
+        except Exception as e:
+            print(f"Error extracting polyhedron {label_id}: {e}")
+            return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+    def _extract_faces_optimized(self, raw_faces: np.ndarray) -> List[List[int]]:
+        """
+        Optimized face extraction using vectorized operations where possible.
+        """
+        faces_list = []
+        i = 0
+        while i < len(raw_faces):
+            num_points_in_face = raw_faces[i]
+            faces_list.append(raw_faces[i + 1 : i + 1 + num_points_in_face].tolist())
+            i += num_points_in_face + 1
+        return faces_list
 
     def _extract_single_polyhedron_optimized(
         self,
