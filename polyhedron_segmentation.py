@@ -16,11 +16,441 @@ from tqdm import tqdm
 import concurrent.futures
 import warnings
 import sys
+import platform
+import subprocess
 
 if sys.platform == "darwin":
     import multiprocessing
 
     multiprocessing.set_start_method("spawn", force=True)
+
+
+# GPU Backend Support
+class GPUBackend:
+    """GPU backend management for CUDA and MPS acceleration."""
+
+    def __init__(self):
+        self.backend = None
+        self.device = None
+        self.available_backends = []
+        self._check_gpu_availability()
+
+    def _check_gpu_availability(self):
+        """Check availability of GPU backends."""
+        # Check CUDA
+        try:
+            import cupy as cp
+
+            if cp.cuda.is_available():
+                self.available_backends.append("cuda")
+                print(f"CUDA detected: {cp.cuda.runtime.getDeviceCount()} GPU(s) available")
+        except ImportError:
+            pass
+
+        # Check MPS (Metal Performance Shaders for Apple Silicon)
+        try:
+            import torch
+
+            if torch.backends.mps.is_available():
+                self.available_backends.append("mps")
+                print("MPS (Metal Performance Shaders) detected and available")
+        except ImportError:
+            pass
+
+        if not self.available_backends:
+            print("No GPU backends available, will use CPU-only processing")
+
+    def set_backend(self, backend: str, memory_fraction: float = 0.8):
+        """Set the GPU backend to use."""
+        if backend == "auto":
+            if "cuda" in self.available_backends:
+                backend = "cuda"
+            elif "mps" in self.available_backends:
+                backend = "mps"
+            else:
+                backend = "cpu"
+
+        if backend == "cpu":
+            self.backend = "cpu"
+            self.device = None
+            print("Using CPU backend")
+            return True
+
+        if backend not in self.available_backends:
+            print(f"Backend '{backend}' not available. Available: {self.available_backends}")
+            return False
+
+        self.backend = backend
+
+        if backend == "cuda":
+            import cupy as cp
+
+            # Set memory pool limit
+            try:
+                memory_limit = int(cp.cuda.runtime.memGetInfo()[1] * memory_fraction)
+                mempool = cp.get_default_memory_pool()
+                mempool.set_limit(size=memory_limit)
+                self.device = cp.cuda.Device()
+                print(f"CUDA backend initialized with {memory_fraction * 100:.1f}% memory limit")
+            except Exception as e:
+                print(f"Warning: Could not set CUDA memory limit: {e}")
+
+        elif backend == "mps":
+            import torch
+
+            self.device = torch.device("mps")
+            print("MPS backend initialized")
+
+        return True
+
+    def to_gpu(self, array: np.ndarray):
+        """Move array to GPU."""
+        if self.backend == "cuda":
+            import cupy as cp
+
+            return cp.asarray(array)
+        elif self.backend == "mps":
+            import torch
+
+            return torch.from_numpy(array).to(self.device)
+        else:
+            return array
+
+    def to_cpu(self, array):
+        """Move array to CPU."""
+        if self.backend == "cuda":
+            import cupy as cp
+
+            if isinstance(array, cp.ndarray):
+                return cp.asnumpy(array)
+        elif self.backend == "mps":
+            import torch
+
+            if isinstance(array, torch.Tensor):
+                return array.cpu().numpy()
+        return array
+
+    def get_module(self, module_name: str):
+        """Get the appropriate module for the backend."""
+        if self.backend == "cuda":
+            import cupy as cp
+
+            if module_name == "numpy":
+                return cp
+            elif module_name == "ndimage":
+                from cupyx.scipy import ndimage as cupy_ndimage
+
+                return cupy_ndimage
+            elif module_name == "filters":
+                try:
+                    from cucim.skimage import filters as cucim_filters
+
+                    return cucim_filters
+                except ImportError:
+                    # Fallback to manual implementation
+                    return None
+        elif self.backend == "mps":
+            import torch
+            import torch.nn.functional as F
+
+            if module_name == "torch":
+                return torch
+            elif module_name == "F":
+                return F
+
+        # CPU fallback
+        if module_name == "numpy":
+            return np
+        elif module_name == "ndimage":
+            return ndimage
+        elif module_name == "filters":
+            return filters
+
+        return None
+
+
+class GPUAcceleratedOperations:
+    """GPU-accelerated implementations of key operations."""
+
+    def __init__(self, gpu_backend: GPUBackend):
+        self.gpu = gpu_backend
+
+    def distance_transform_edt(self, binary_array: np.ndarray) -> np.ndarray:
+        """GPU-accelerated distance transform."""
+        if self.gpu.backend == "cuda":
+            try:
+                import cupy as cp
+                from cupyx.scipy import ndimage as cupy_ndimage
+
+                gpu_array = cp.asarray(binary_array)
+                distance = cupy_ndimage.distance_transform_edt(gpu_array)
+                return cp.asnumpy(distance)
+            except Exception as e:
+                print(f"CUDA distance transform failed, falling back to CPU: {e}")
+
+        elif self.gpu.backend == "mps":
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                # Convert to torch tensor
+                tensor = torch.from_numpy(binary_array.astype(np.float32)).to(self.gpu.device)
+
+                # Custom MPS distance transform implementation
+                distance = self._mps_distance_transform(tensor)
+                return distance.cpu().numpy()
+            except Exception as e:
+                print(f"MPS distance transform failed, falling back to CPU: {e}")
+
+        # CPU fallback
+        return ndimage.distance_transform_edt(binary_array)
+
+    def _mps_distance_transform(self, binary_tensor):
+        """Custom distance transform implementation for MPS."""
+        import torch
+        import torch.nn.functional as F
+
+        # This is a simplified distance transform using morphological operations
+        # For better accuracy, consider implementing chamfer distance transform
+        binary_float = binary_tensor.float()
+
+        # Create structuring element for 3D
+        kernel_size = 3
+        kernel = torch.ones(1, 1, kernel_size, kernel_size, kernel_size, device=binary_tensor.device)
+        kernel = kernel / kernel.sum()
+
+        # Iterative distance computation
+        distance = torch.zeros_like(binary_float)
+        current = binary_float.clone()
+
+        for i in range(1, 50):  # Maximum distance
+            if current.sum() == 0:
+                break
+
+            # Add current distance level
+            distance += current * i
+
+            # Erode current mask
+            padded = F.pad(current.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1, 1, 1), mode="constant", value=0)
+            eroded = F.conv3d(padded, kernel, padding=0)
+            current = (eroded.squeeze() > 0.99).float()
+
+            # Remove already processed pixels
+            current = current * (distance == 0).float()
+
+        return distance
+
+    def gaussian_filter(self, array: np.ndarray, sigma: float) -> np.ndarray:
+        """GPU-accelerated Gaussian filtering."""
+        if self.gpu.backend == "cuda":
+            try:
+                import cupy as cp
+                from cupyx.scipy import ndimage as cupy_ndimage
+
+                gpu_array = cp.asarray(array)
+                filtered = cupy_ndimage.gaussian_filter(gpu_array, sigma=sigma)
+                return cp.asnumpy(filtered)
+            except Exception as e:
+                print(f"CUDA Gaussian filter failed, falling back to CPU: {e}")
+
+        elif self.gpu.backend == "mps":
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                tensor = torch.from_numpy(array.astype(np.float32)).to(self.gpu.device)
+                filtered = self._mps_gaussian_filter(tensor, sigma)
+                return filtered.cpu().numpy()
+            except Exception as e:
+                print(f"MPS Gaussian filter failed, falling back to CPU: {e}")
+
+        # CPU fallback
+        return filters.gaussian(array, sigma=sigma)
+
+    def _mps_gaussian_filter(self, tensor, sigma):
+        """Custom 3D Gaussian filter for MPS."""
+        import torch
+        import torch.nn.functional as F
+
+        # Create 3D Gaussian kernel
+        kernel_size = int(6 * sigma + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        # Generate 3D Gaussian kernel
+        coords = torch.arange(kernel_size, dtype=torch.float32, device=tensor.device) - kernel_size // 2
+        kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+
+        # Create 3D kernel
+        kernel_3d = kernel_1d.view(-1, 1, 1) * kernel_1d.view(1, -1, 1) * kernel_1d.view(1, 1, -1)
+        kernel_3d = kernel_3d.unsqueeze(0).unsqueeze(0)
+
+        # Apply convolution
+        tensor_5d = tensor.unsqueeze(0).unsqueeze(0)
+        padding = kernel_size // 2
+        filtered = F.conv3d(tensor_5d, kernel_3d, padding=padding)
+
+        return filtered.squeeze()
+
+    def binary_erosion(self, binary_array: np.ndarray, iterations: int = 1) -> np.ndarray:
+        """GPU-accelerated binary erosion."""
+        if self.gpu.backend == "cuda":
+            try:
+                import cupy as cp
+                from cupyx.scipy import ndimage as cupy_ndimage
+
+                gpu_array = cp.asarray(binary_array)
+                result = gpu_array.copy()
+                for _ in range(iterations):
+                    result = cupy_ndimage.binary_erosion(result)
+                return cp.asnumpy(result)
+            except Exception as e:
+                print(f"CUDA erosion failed, falling back to CPU: {e}")
+
+        elif self.gpu.backend == "mps":
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                tensor = torch.from_numpy(binary_array.astype(np.float32)).to(self.gpu.device)
+                result = self._mps_binary_erosion(tensor, iterations)
+                return (result > 0.5).cpu().numpy()
+            except Exception as e:
+                print(f"MPS erosion failed, falling back to CPU: {e}")
+
+        # CPU fallback
+        result = binary_array.copy()
+        for _ in range(iterations):
+            result = morphology.binary_erosion(result)
+        return result
+
+    def _mps_binary_erosion(self, binary_tensor, iterations):
+        """Custom binary erosion for MPS."""
+        import torch
+        import torch.nn.functional as F
+
+        # 3D erosion kernel (6-connectivity)
+        kernel = torch.zeros(1, 1, 3, 3, 3, device=binary_tensor.device)
+        kernel[0, 0, 1, 1, 1] = 1  # center
+        kernel[0, 0, 0, 1, 1] = 1  # front
+        kernel[0, 0, 2, 1, 1] = 1  # back
+        kernel[0, 0, 1, 0, 1] = 1  # left
+        kernel[0, 0, 1, 2, 1] = 1  # right
+        kernel[0, 0, 1, 1, 0] = 1  # bottom
+        kernel[0, 0, 1, 1, 2] = 1  # top
+
+        result = binary_tensor.float()
+        for _ in range(iterations):
+            padded = F.pad(result.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1, 1, 1), mode="constant", value=0)
+            convolved = F.conv3d(padded, kernel, padding=0)
+            result = (convolved.squeeze() >= 7).float()  # All 7 pixels must be True
+
+        return result
+
+    def watershed_segmentation(self, distance: np.ndarray, markers: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """GPU-accelerated watershed segmentation."""
+        if self.gpu.backend == "cuda":
+            try:
+                # Try cuCIM if available
+                from cucim.skimage.segmentation import watershed as cuda_watershed
+
+                gpu_distance = self.gpu.to_gpu(distance)
+                gpu_markers = self.gpu.to_gpu(markers)
+                gpu_mask = self.gpu.to_gpu(mask)
+
+                result = cuda_watershed(gpu_distance, gpu_markers, mask=gpu_mask)
+                return self.gpu.to_cpu(result)
+            except ImportError:
+                print("cuCIM not available, falling back to CPU watershed")
+            except Exception as e:
+                print(f"CUDA watershed failed, falling back to CPU: {e}")
+
+        # CPU fallback (MPS doesn't have good watershed implementation)
+        return watershed(distance, markers, mask=mask)
+
+
+# Initialize global GPU backend
+_gpu_backend = GPUBackend()
+_gpu_ops = GPUAcceleratedOperations(_gpu_backend)
+
+
+def get_optimal_worker_count(task_type: str = "cpu_intensive") -> int:
+    """
+    Get optimal number of workers based on system architecture.
+
+    For Apple Silicon Macs, this tries to detect P-core count for CPU-intensive tasks.
+    For other systems, falls back to CPU count with reasonable limits.
+
+    Args:
+        task_type: "cpu_intensive" for mesh processing, "mixed" for chunk processing
+
+    Returns:
+        Optimal number of workers
+    """
+    total_cores = os.cpu_count()
+
+    # Try to detect Apple Silicon and get P-core count
+    if sys.platform == "darwin":
+        try:
+            # Check if this is Apple Silicon
+            machine = platform.machine()
+            if machine in ["arm64", "aarch64"]:
+                # Try to get performance core count using system_profiler
+                try:
+                    result = subprocess.run(
+                        ["system_profiler", "SPHardwareDataType"], capture_output=True, text=True, timeout=5
+                    )
+
+                    if result.returncode == 0:
+                        # Look for performance cores info
+                        for line in result.stdout.split("\n"):
+                            if "Performance Cores" in line:
+                                # Extract number of P-cores
+                                parts = line.split(":")
+                                if len(parts) > 1:
+                                    p_cores = int(parts[1].strip())
+                                    print(f"Detected Apple Silicon with {p_cores} P-cores, {total_cores} total cores")
+
+                                    if task_type == "cpu_intensive":
+                                        # For CPU-intensive tasks, use P-cores + 1-2 extra for efficiency
+                                        optimal = min(p_cores + 2, total_cores)
+                                        print(f"Using {optimal} workers for CPU-intensive tasks (P-cores + 2)")
+                                        return optimal
+                                    else:
+                                        # For mixed tasks, can use more cores
+                                        optimal = min(p_cores * 2, total_cores)
+                                        return optimal
+
+                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
+                    pass
+
+                # Fallback for Apple Silicon if system_profiler fails
+                # apple silicon m4 has 6 efficiency cores and 4 power cores
+                p_cores = 4
+
+                # for cpu intensive tasks use 1 more core than the power cores
+                if task_type == "cpu_intensive":
+                    optimal = min(p_cores + 1, total_cores)
+                    print(f"Using {optimal} workers for CPU-intensive tasks")
+                    return optimal
+                else:
+                    optimal = min(p_cores + 2, total_cores)
+                    return optimal
+
+        except Exception as e:
+            print(f"Failed to detect Apple Silicon configuration: {e}")
+
+    # Fallback for non-Apple Silicon or detection failure
+    if task_type == "cpu_intensive":
+        # For CPU-intensive tasks, use fewer workers to avoid thread thrashing
+        optimal = min(total_cores, max(1, total_cores - 2))
+    else:
+        # For mixed/I/O tasks, can use more workers
+        optimal = total_cores
+
+    print(f"Using {optimal} workers (fallback strategy)")
+    return optimal
 
 
 def validate_mesh_coordinates(vertices: np.ndarray, label_id: int, max_reasonable_coord: float = 1e4) -> bool:
@@ -100,12 +530,16 @@ class PolyhedronSegmentation:
     """
     Advanced polyhedron segmentation for long voxel grids using watershed.
     Extracts individual polyhedrons and outputs them with global coordinates.
+    Supports GPU acceleration via CUDA and MPS backends.
     """
 
     def __init__(
         self,
         voxel_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
         origin: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        gpu_backend: str = "auto",
+        gpu_memory_fraction: float = 0.8,
+        min_size_for_gpu: int = 1000000,  # Use GPU for grids larger than 1M voxels
     ):
         """
         Initialize the segmentation module.
@@ -113,9 +547,81 @@ class PolyhedronSegmentation:
         Args:
             voxel_spacing: Physical spacing between voxels (dx, dy, dz)
             origin: Origin point of the voxel grid in world coordinates
+            gpu_backend: GPU backend to use ('auto', 'cuda', 'mps', 'cpu')
+            gpu_memory_fraction: Fraction of GPU memory to use (0.1-0.9)
+            min_size_for_gpu: Minimum grid size to trigger GPU acceleration
         """
         self.voxel_spacing = np.array(voxel_spacing)
         self.origin = np.array(origin)
+        self.min_size_for_gpu = min_size_for_gpu
+
+        # Initialize GPU backend
+        self.gpu_enabled = _gpu_backend.set_backend(gpu_backend, gpu_memory_fraction)
+        self.gpu_backend_name = _gpu_backend.backend
+
+        if self.gpu_enabled and self.gpu_backend_name != "cpu":
+            print(f"GPU acceleration enabled with {self.gpu_backend_name.upper()} backend")
+        else:
+            print("Using CPU-only processing")
+
+    def _should_use_gpu(self, array_size: int) -> bool:
+        """Determine if GPU should be used based on array size and availability."""
+        return self.gpu_enabled and self.gpu_backend_name != "cpu" and array_size >= self.min_size_for_gpu
+
+    def _get_gpu_memory_info(self) -> Dict[str, int]:
+        """Get GPU memory information."""
+        if self.gpu_backend_name == "cuda":
+            try:
+                import cupy as cp
+
+                free, total = cp.cuda.runtime.memGetInfo()
+                return {"free": free, "total": total, "used": total - free}
+            except Exception:
+                return {"free": 0, "total": 0, "used": 0}
+        elif self.gpu_backend_name == "mps":
+            try:
+                import torch
+
+                allocated = torch.mps.current_allocated_memory()
+                # MPS doesn't provide total memory info easily
+                return {"free": -1, "total": -1, "used": allocated}
+            except Exception:
+                return {"free": 0, "total": 0, "used": 0}
+        return {"free": 0, "total": 0, "used": 0}
+
+    def _estimate_gpu_memory_needed(self, grid_shape: Tuple[int, int, int], dtype=np.float32) -> int:
+        """Estimate GPU memory needed for processing a grid of given shape."""
+        bytes_per_element = np.dtype(dtype).itemsize
+        # Estimate: input grid + distance transform + SDF + working arrays
+        multiplier = 5  # Conservative estimate for temporary arrays
+        return int(np.prod(grid_shape) * bytes_per_element * multiplier)
+
+    def _optimize_chunk_size_for_gpu(
+        self, grid_shape: Tuple[int, int, int], default_chunk_size: Tuple[int, int, int]
+    ) -> Tuple[int, int, int]:
+        """Optimize chunk size based on available GPU memory."""
+        if not self._should_use_gpu(np.prod(grid_shape)):
+            return default_chunk_size
+
+        memory_info = self._get_gpu_memory_info()
+        if memory_info["free"] <= 0:  # Unknown memory or MPS
+            return default_chunk_size
+
+        # Use 70% of available memory
+        available_memory = int(memory_info["free"] * 0.7)
+
+        # Calculate optimal chunk size
+        default_memory_needed = self._estimate_gpu_memory_needed(default_chunk_size)
+
+        if default_memory_needed <= available_memory:
+            return default_chunk_size
+
+        # Scale down chunk size
+        scale_factor = (available_memory / default_memory_needed) ** (1 / 3)
+        optimized_size = tuple(max(64, int(s * scale_factor)) for s in default_chunk_size)
+
+        print(f"GPU memory optimization: chunk size adjusted from {default_chunk_size} to {optimized_size}")
+        return optimized_size
 
     def compute_sdf(self, binary_voxel: np.ndarray, scale: float = 5.0) -> np.ndarray:
         """
@@ -131,12 +637,21 @@ class PolyhedronSegmentation:
         Returns:
             SDF array where positive values are inside objects, negative outside
         """
+        use_gpu = self._should_use_gpu(binary_voxel.size)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Distance from background (outside)
-            distance_outside = ndimage.distance_transform_edt(binary_voxel == 0)
-            # Distance from foreground (inside)
-            distance_inside = ndimage.distance_transform_edt(binary_voxel == 1)
+
+            if use_gpu:
+                print(f"Computing SDF using {self.gpu_backend_name.upper()} acceleration...")
+                # Distance from background (outside)
+                distance_outside = _gpu_ops.distance_transform_edt(binary_voxel == 0)
+                # Distance from foreground (inside)
+                distance_inside = _gpu_ops.distance_transform_edt(binary_voxel == 1)
+            else:
+                # CPU fallback
+                distance_outside = ndimage.distance_transform_edt(binary_voxel == 0)
+                distance_inside = ndimage.distance_transform_edt(binary_voxel == 1)
 
         # Create signed distance field: positive inside, negative outside
         sdf = distance_inside - distance_outside
@@ -269,7 +784,12 @@ class PolyhedronSegmentation:
         if gaussian_sigma > 0:
             print(f"Applying Gaussian smoothing with sigma: {gaussian_sigma}")
             # Smooth the original values, then re-threshold
-            smoothed = filters.gaussian(voxel_grid.astype(float), sigma=gaussian_sigma)
+            use_gpu = self._should_use_gpu(voxel_grid.size)
+            if use_gpu:
+                print(f"Using {self.gpu_backend_name.upper()} acceleration for Gaussian smoothing")
+                smoothed = _gpu_ops.gaussian_filter(voxel_grid.astype(float), sigma=gaussian_sigma)
+            else:
+                smoothed = filters.gaussian(voxel_grid.astype(float), sigma=gaussian_sigma)
             binary_grid = smoothed > binary_threshold
 
         # Remove small objects
@@ -406,7 +926,12 @@ class PolyhedronSegmentation:
         # We use negative SDF because watershed finds minima, but we want to segment from maxima
         print("Performing watershed on SDF...")
         # The mask for watershed should be the original binary_grid, not an eroded one unless intended
-        labels = watershed(-sdf, markers, mask=binary_grid)
+        use_gpu = self._should_use_gpu(sdf.size)
+        if use_gpu:
+            print(f"Using {self.gpu_backend_name.upper()} acceleration for SDF watershed")
+            labels = _gpu_ops.watershed_segmentation(-sdf, markers, binary_grid)
+        else:
+            labels = watershed(-sdf, markers, mask=binary_grid)
 
         num_labels = len(np.unique(labels)) - 1  # Exclude background (0)
         print(f"SDF-based watershed segmentation found {num_labels} objects")
@@ -427,24 +952,38 @@ class PolyhedronSegmentation:
         print("Performing enhanced watershed segmentation (distance transform based)...")
 
         current_grid = binary_grid.copy()
+        use_gpu = self._should_use_gpu(current_grid.size)
+
         # Apply erosion to separate touching objects
         if erosion_iterations > 0:
             print(f"Applying binary erosion with {erosion_iterations} iterations...")
-            eroded_grid = current_grid
-            for _ in range(erosion_iterations):
-                eroded_grid = morphology.binary_erosion(eroded_grid)
+            if use_gpu:
+                print(f"Using {self.gpu_backend_name.upper()} acceleration for erosion")
+                eroded_grid = _gpu_ops.binary_erosion(current_grid, erosion_iterations)
+            else:
+                eroded_grid = current_grid
+                for _ in range(erosion_iterations):
+                    eroded_grid = morphology.binary_erosion(eroded_grid)
+
             if np.sum(eroded_grid) == 0:
                 print("Warning: Erosion resulted in an empty grid. Using original grid for segmentation.")
             else:
                 current_grid = eroded_grid
 
         # Compute distance transform on the (potentially eroded) grid
-        distance = ndimage.distance_transform_edt(current_grid)
+        if use_gpu:
+            print(f"Computing distance transform using {self.gpu_backend_name.upper()} acceleration")
+            distance = _gpu_ops.distance_transform_edt(current_grid)
+        else:
+            distance = ndimage.distance_transform_edt(current_grid)
 
         # Optionally smooth the distance transform
         if gaussian_smooth_dt_sigma > 0:
             print(f"Smoothing distance transform with sigma: {gaussian_smooth_dt_sigma}")
-            distance = filters.gaussian(distance, sigma=gaussian_smooth_dt_sigma)
+            if use_gpu:
+                distance = _gpu_ops.gaussian_filter(distance, sigma=gaussian_smooth_dt_sigma)
+            else:
+                distance = filters.gaussian(distance, sigma=gaussian_smooth_dt_sigma)
 
         # Define footprint for peak_local_max
         footprint = None
@@ -479,7 +1018,11 @@ class PolyhedronSegmentation:
 
         # Perform watershed using the negative distance transform
         # Mask with current_grid (which could be the eroded version or original if erosion failed)
-        labels = watershed(-distance, markers, mask=current_grid)
+        if use_gpu:
+            print(f"Performing watershed using {self.gpu_backend_name.upper()} acceleration")
+            labels = _gpu_ops.watershed_segmentation(-distance, markers, current_grid)
+        else:
+            labels = watershed(-distance, markers, mask=current_grid)
 
         num_labels = len(np.unique(labels)) - 1  # Exclude background (0)
         print(f"Enhanced watershed segmentation found {num_labels} objects")
@@ -840,6 +1383,9 @@ class PolyhedronSegmentation:
         overlap: int = 32,
         max_chunk_workers: int = None,
         fast_merge: bool = True,  # New parameter for merge strategy
+        ultra_fast_mode: bool = False,  # NEW: Ultra-fast mode with aggressive optimizations
+        max_labels_threshold: int = 5000,  # NEW: Threshold for enabling aggressive optimizations
+        stream_batch_size: int = 50,  # NEW: Batch size for streaming large label sets
         **kwargs,
     ) -> Dict:
         """
@@ -859,9 +1405,26 @@ class PolyhedronSegmentation:
         print("=" * 60)
         print("CHUNKED POLYHEDRON SEGMENTATION PIPELINE")
         print(f"Grid shape: {voxel_grid.shape}")
+        print(f"GPU backend: {self.gpu_backend_name.upper()}")
+
+        # Optimize chunk size for GPU if enabled
+        original_chunk_size = chunk_size
+        if self._should_use_gpu(voxel_grid.size):
+            chunk_size = self._optimize_chunk_size_for_gpu(voxel_grid.shape, chunk_size)
+            if chunk_size != original_chunk_size:
+                print(f"GPU-optimized chunk size: {chunk_size} (was {original_chunk_size})")
+
         print(f"Chunk size: {chunk_size}")
         print(f"Overlap: {overlap}")
+        if ultra_fast_mode:
+            print("ULTRA-FAST MODE ENABLED - Prioritizing speed over accuracy")
         print("=" * 60)
+
+        # Optimize overlap for ultra-fast mode
+        if ultra_fast_mode and overlap > 16:
+            original_overlap = overlap
+            overlap = max(8, overlap // 2)  # Reduce overlap for speed
+            print(f"Ultra-fast mode: Reducing overlap from {original_overlap} to {overlap} for speed")
 
         # Extract parameters
         segmentation_method = kwargs.get("segmentation_method", "watershed")
@@ -891,7 +1454,7 @@ class PolyhedronSegmentation:
         }
 
         # Step 4: Process chunks
-        chunk_workers = max_chunk_workers or min(len(chunks), os.cpu_count())
+        chunk_workers = max_chunk_workers or min(len(chunks), get_optimal_worker_count("mixed"))
         chunk_results = []
 
         if chunk_workers > 1 and len(chunks) > 1:
@@ -920,15 +1483,27 @@ class PolyhedronSegmentation:
                 result = self._process_chunk(binary_chunk, chunk_slice, segmentation_method, segment_params, i)
                 chunk_results.append(result)
 
-        # Step 5: Merge chunk results
-        labeled_grid, num_labels = self._merge_chunk_results(chunk_results, binary_grid.shape, overlap, fast_merge)
+        # Step 5: Merge chunk results with optimization selection
+        if ultra_fast_mode:
+            print("Using ultra-fast chunk merging...")
+            labeled_grid, num_labels = self._merge_chunk_results_ultra_fast(chunk_results, binary_grid.shape, overlap)
+        else:
+            labeled_grid, num_labels = self._merge_chunk_results(chunk_results, binary_grid.shape, overlap, fast_merge)
 
         if num_labels == 0:
             print("No polyhedrons found after chunked segmentation!")
             return {"polyhedrons": {}, "metadata": {"total_count": 0, "chunked": True}}
 
-        # Step 6: Continue with standard pipeline for filtering and mesh extraction
-        print(f"Continuing with standard pipeline for {num_labels} labels...")
+        # Step 6: Continue with optimized pipeline
+        print(f"Continuing with optimized pipeline for {num_labels} labels...")
+
+        # Check if we need aggressive optimizations for large label counts
+        use_aggressive_opts = ultra_fast_mode or num_labels > max_labels_threshold
+        if use_aggressive_opts:
+            print(f"Large label count ({num_labels}) detected - enabling aggressive optimizations...")
+            kwargs["_use_early_filtering"] = True
+            kwargs["_use_streaming"] = True
+            kwargs["_stream_batch_size"] = stream_batch_size
 
         # Use the existing process_voxel_grid logic for the rest of the pipeline
         # but skip the preprocessing and segmentation steps
@@ -967,82 +1542,99 @@ class PolyhedronSegmentation:
         small_polyhedron_threshold = kwargs.get("small_polyhedron_threshold", 500)
         reduce_smoothing_for_small = kwargs.get("reduce_smoothing_for_small", True)
 
-        # Step 1: Filter polyhedrons by size and optionally remove boundary polyhedrons
+        # Step 1: Filter polyhedrons - use optimized early filtering if enabled
         print(f"\nInitial labels found: {num_labels}")
         polyhedrons = {}
 
-        # First, filter by minimum size
-        candidate_label_ids = [
-            label_id
-            for label_id in range(1, num_labels + 1)
-            if np.sum(labeled_grid == label_id) >= min_polyhedron_size
-        ]
-        print(
-            f"Labels remaining after min_polyhedron_size ({min_polyhedron_size} voxels) filter: {len(candidate_label_ids)}"
-        )
+        # Check if we should use fast early filtering
+        use_early_filtering = kwargs.get("_use_early_filtering", False)
 
-        label_ids_to_process = candidate_label_ids
-        boundary_removed_count = 0
-        aspect_ratio_removed_count = 0
-
-        if remove_boundary_polyhedrons and len(label_ids_to_process) > 0:
-            print("Identifying and removing polyhedrons touching the grid boundary...")
-            boundary_labels = set()
-            dims = labeled_grid.shape
-            # Z boundaries
-            boundary_labels.update(np.unique(labeled_grid[0, :, :]))
-            boundary_labels.update(np.unique(labeled_grid[dims[0] - 1, :, :]))
-            # Y boundaries
-            boundary_labels.update(np.unique(labeled_grid[:, 0, :]))
-            boundary_labels.update(np.unique(labeled_grid[:, dims[1] - 1, :]))
-            # X boundaries
-            boundary_labels.update(np.unique(labeled_grid[:, :, 0]))
-            boundary_labels.update(np.unique(labeled_grid[:, :, dims[2] - 1]))
-
-            if 0 in boundary_labels:  # Remove background label if present
-                boundary_labels.remove(0)
-
-            initial_count_before_boundary_filter = len(label_ids_to_process)
-            temp_label_ids_after_boundary = []
-            for label_id in label_ids_to_process:
-                if label_id not in boundary_labels:
-                    temp_label_ids_after_boundary.append(label_id)
-                else:
-                    boundary_removed_count += 1
-
-            label_ids_to_process = temp_label_ids_after_boundary
-            print(
-                f"Removed {boundary_removed_count} polyhedrons touching the boundary (out of {initial_count_before_boundary_filter} candidates)."
+        if use_early_filtering:
+            print("Using optimized early filtering...")
+            label_ids_to_process, filter_stats = self._early_filter_labels_in_chunks(
+                labeled_grid, num_labels, min_polyhedron_size, remove_boundary_polyhedrons, max_voxel_aspect_ratio
             )
-            print(f"Labels remaining after boundary filter: {len(label_ids_to_process)}")
+            boundary_removed_count = filter_stats["boundary_removed_count"]
+            aspect_ratio_removed_count = filter_stats["aspect_ratio_removed_count"]
+            # For metadata consistency, get the initial count of labels that passed min size filter
+            min_size_filtered_count = filter_stats.get("initial_size_filtered_count", 0)
+        else:
+            # Original filtering logic
+            print("Using standard filtering...")
 
-        # Aspect Ratio Filtering
-        if max_voxel_aspect_ratio is not None and max_voxel_aspect_ratio > 0 and len(label_ids_to_process) > 0:
-            print(f"Filtering polyhedrons by max voxel aspect ratio ({max_voxel_aspect_ratio})...")
-            initial_count_before_aspect_filter = len(label_ids_to_process)
-            label_ids_after_aspect_ratio_filter = []
-            for label_id in label_ids_to_process:
-                coords = np.argwhere(labeled_grid == label_id)
-                if coords.shape[0] < 2:
-                    label_ids_after_aspect_ratio_filter.append(label_id)
-                    continue
-
-                min_coords = np.min(coords, axis=0)
-                max_coords = np.max(coords, axis=0)
-                dims = max_coords - min_coords + 1
-                dims = np.maximum(dims, 1)
-                current_aspect_ratio = np.max(dims) / np.min(dims)
-
-                if current_aspect_ratio <= max_voxel_aspect_ratio:
-                    label_ids_after_aspect_ratio_filter.append(label_id)
-                else:
-                    aspect_ratio_removed_count += 1
-
-            label_ids_to_process = label_ids_after_aspect_ratio_filter
+            # First, filter by minimum size
+            candidate_label_ids = [
+                label_id
+                for label_id in range(1, num_labels + 1)
+                if np.sum(labeled_grid == label_id) >= min_polyhedron_size
+            ]
             print(
-                f"Removed {aspect_ratio_removed_count} polyhedrons due to aspect ratio filter (out of {initial_count_before_aspect_filter} candidates)."
+                f"Labels remaining after min_polyhedron_size ({min_polyhedron_size} voxels) filter: {len(candidate_label_ids)}"
             )
-            print(f"Labels remaining after aspect ratio filter: {len(label_ids_to_process)}")
+
+            min_size_filtered_count = len(candidate_label_ids)  # Store for metadata
+            label_ids_to_process = candidate_label_ids
+            boundary_removed_count = 0
+            aspect_ratio_removed_count = 0
+
+            if remove_boundary_polyhedrons and len(label_ids_to_process) > 0:
+                print("Identifying and removing polyhedrons touching the grid boundary...")
+                boundary_labels = set()
+                dims = labeled_grid.shape
+                # Z boundaries
+                boundary_labels.update(np.unique(labeled_grid[0, :, :]))
+                boundary_labels.update(np.unique(labeled_grid[dims[0] - 1, :, :]))
+                # Y boundaries
+                boundary_labels.update(np.unique(labeled_grid[:, 0, :]))
+                boundary_labels.update(np.unique(labeled_grid[:, dims[1] - 1, :]))
+                # X boundaries
+                boundary_labels.update(np.unique(labeled_grid[:, :, 0]))
+                boundary_labels.update(np.unique(labeled_grid[:, :, dims[2] - 1]))
+
+                if 0 in boundary_labels:  # Remove background label if present
+                    boundary_labels.remove(0)
+
+                initial_count_before_boundary_filter = len(label_ids_to_process)
+                temp_label_ids_after_boundary = []
+                for label_id in label_ids_to_process:
+                    if label_id not in boundary_labels:
+                        temp_label_ids_after_boundary.append(label_id)
+                    else:
+                        boundary_removed_count += 1
+
+                label_ids_to_process = temp_label_ids_after_boundary
+                print(
+                    f"Removed {boundary_removed_count} polyhedrons touching the boundary (out of {initial_count_before_boundary_filter} candidates)."
+                )
+                print(f"Labels remaining after boundary filter: {len(label_ids_to_process)}")
+
+            # Aspect Ratio Filtering
+            if max_voxel_aspect_ratio is not None and max_voxel_aspect_ratio > 0 and len(label_ids_to_process) > 0:
+                print(f"Filtering polyhedrons by max voxel aspect ratio ({max_voxel_aspect_ratio})...")
+                initial_count_before_aspect_filter = len(label_ids_to_process)
+                label_ids_after_aspect_ratio_filter = []
+                for label_id in label_ids_to_process:
+                    coords = np.argwhere(labeled_grid == label_id)
+                    if coords.shape[0] < 2:
+                        label_ids_after_aspect_ratio_filter.append(label_id)
+                        continue
+
+                    min_coords = np.min(coords, axis=0)
+                    max_coords = np.max(coords, axis=0)
+                    dims = max_coords - min_coords + 1
+                    dims = np.maximum(dims, 1)
+                    current_aspect_ratio = np.max(dims) / np.min(dims)
+
+                    if current_aspect_ratio <= max_voxel_aspect_ratio:
+                        label_ids_after_aspect_ratio_filter.append(label_id)
+                    else:
+                        aspect_ratio_removed_count += 1
+
+                label_ids_to_process = label_ids_after_aspect_ratio_filter
+                print(
+                    f"Removed {aspect_ratio_removed_count} polyhedrons due to aspect ratio filter (out of {initial_count_before_aspect_filter} candidates)."
+                )
+                print(f"Labels remaining after aspect ratio filter: {len(label_ids_to_process)}")
 
         if not label_ids_to_process:
             print("No polyhedrons left to process after filtering!")
@@ -1066,7 +1658,31 @@ class PolyhedronSegmentation:
 
         candidate_polyhedron_mesh_data_list = []
 
-        if fast_mesh_extraction:
+        # Check if we should use streaming processing for large label sets
+        use_streaming = kwargs.get("_use_streaming", False)
+        stream_batch_size = kwargs.get("_stream_batch_size", 50)
+
+        if use_streaming and stream_batch_size > 0 and len(label_ids_to_process) > stream_batch_size:
+            print(f"Using streaming processing for {len(label_ids_to_process)} labels...")
+
+            # Prepare processing parameters
+            processing_params = {
+                "smoothing_iterations": smoothing_iterations,
+                "decimation_ratio": decimation_ratio,
+                "use_sdf": use_sdf,
+                "coordinate_validation_threshold": coordinate_validation_threshold,
+                "batch_mesh_size": batch_mesh_size,
+                "skip_sdf_for_small": skip_sdf_for_small,
+                "small_polyhedron_threshold": small_polyhedron_threshold,
+                "reduce_smoothing_for_small": reduce_smoothing_for_small,
+                "num_workers": num_workers,
+                "fast_mesh_extraction": fast_mesh_extraction,
+            }
+
+            candidate_polyhedron_mesh_data_list = self._stream_process_large_label_set(
+                labeled_grid, label_ids_to_process, processing_params, stream_batch_size
+            )
+        elif fast_mesh_extraction:
             # Use optimized batch processing
             candidate_polyhedron_mesh_data_list = self._extract_polyhedrons_fast(
                 labeled_grid,
@@ -1084,8 +1700,10 @@ class PolyhedronSegmentation:
         else:
             # Use original method
             if num_workers > 1 and len(label_ids_to_process) > 1:
-                print(f"Using {num_workers} parallel workers for mesh extraction...")
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Optimize worker count for CPU-intensive mesh extraction
+                optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
+                print(f"Using {optimal_workers} parallel workers for mesh extraction...")
+                with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
                     futures = [
                         executor.submit(
                             _global_mesh_task,
@@ -1230,7 +1848,7 @@ class PolyhedronSegmentation:
         metadata = {
             "total_count": len(polyhedrons),
             "original_labels": num_labels,
-            "min_size_filtered_count": len(candidate_label_ids),
+            "min_size_filtered_count": min_size_filtered_count,
             "boundary_removed_count": boundary_removed_count,
             "aspect_ratio_removed_count": aspect_ratio_removed_count,
             "final_extracted_count": len(polyhedrons),
@@ -1349,13 +1967,19 @@ class PolyhedronSegmentation:
         """
         all_results = []
 
+        # If batch_size is 0 or negative, process all polyhedrons in one batch
+        if batch_size <= 0:
+            batch_size = len(polyhedron_list)
+            print(f"Batch size is 0, processing all {len(polyhedron_list)} polyhedrons in one batch (no batching)")
+
         # Process in batches
         for i in tqdm(range(0, len(polyhedron_list), batch_size), desc="Processing batches"):
             batch = polyhedron_list[i : i + batch_size]
 
             if num_workers > 1 and len(batch) > 1:
-                # Parallel processing within batch
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_workers, len(batch))) as executor:
+                # Parallel processing within batch - use ThreadPoolExecutor for I/O bound mesh operations
+                optimal_batch_workers = min(num_workers, len(batch), get_optimal_worker_count("mixed"))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_batch_workers) as executor:
                     futures = []
                     for label_id, polyhedron_size in batch:
                         future = executor.submit(
@@ -1877,7 +2501,8 @@ class PolyhedronSegmentation:
         candidate_polyhedron_mesh_data_list = []  # Store (label_id, polyhedron_size, mesh_data)
 
         if fast_mesh_extraction:
-            # Use optimized batch processing
+            # Use optimized batch processing with optimal worker count
+            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
             candidate_polyhedron_mesh_data_list = self._extract_polyhedrons_fast(
                 labeled_grid,
                 label_ids_to_process,
@@ -1889,11 +2514,13 @@ class PolyhedronSegmentation:
                 skip_sdf_for_small,
                 small_polyhedron_threshold,
                 reduce_smoothing_for_small,
-                num_workers,
+                optimal_workers,
             )
         elif num_workers > 1 and len(label_ids_to_process) > 1:
-            print(f"Using {num_workers} parallel workers for mesh extraction...")
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Optimize worker count for CPU-intensive mesh extraction
+            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
+            print(f"Using {optimal_workers} parallel workers for mesh extraction...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
                 futures = [
                     executor.submit(
                         _global_mesh_task,
@@ -2112,6 +2739,31 @@ class PolyhedronSegmentation:
         vertices_array = np.array(vertices)
         return {"min": np.min(vertices_array, axis=0).tolist(), "max": np.max(vertices_array, axis=0).tolist()}
 
+    def _convert_numpy_types(self, obj):
+        """
+        Recursively convert NumPy types to native Python types for JSON serialization.
+
+        Args:
+            obj: Object that may contain NumPy types
+
+        Returns:
+            Object with NumPy types converted to Python types
+        """
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._convert_numpy_types(item) for item in obj)
+        else:
+            return obj
+
     def save_to_json(self, polyhedrons_data: Dict, output_path: str, indent: int = 2, compress: bool = False):
         """
         Save polyhedrons data to JSON file.
@@ -2127,15 +2779,18 @@ class PolyhedronSegmentation:
         # Ensure output directory exists
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+        # Convert NumPy types to native Python types for JSON serialization
+        json_compatible_data = self._convert_numpy_types(polyhedrons_data)
+
         if compress:
             import gzip
 
             with gzip.open(output_path + ".gz", "wt", encoding="utf-8") as f:
-                json.dump(polyhedrons_data, f, indent=indent)
+                json.dump(json_compatible_data, f, indent=indent)
             print(f"Compressed JSON saved to: {output_path}.gz")
         else:
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(polyhedrons_data, f, indent=indent)
+                json.dump(json_compatible_data, f, indent=indent)
             print(f"JSON saved to: {output_path}")
 
     def load_from_json(self, json_path: str) -> Dict:
@@ -2275,21 +2930,37 @@ class PolyhedronSegmentation:
                 traceback.print_exc()
 
     def save_to_paraview(
-        self, polyhedrons_data: Dict, output_path: str, multiblock: bool = True, include_z_depth: bool = True
+        self,
+        polyhedrons_data: Dict,
+        output_path: str,
+        multiblock: bool = True,
+        include_z_depth: bool = True,
+        fast_export: bool = True,  # New parameter for speed optimization
+        export_batch_size: int = 100,  # Process polyhedrons in batches
+        num_export_workers: int = None,  # Parallel processing workers
     ):
         """
         Export all polyhedrons to a Paraview-compatible file (.vtp or .vtm).
+        Optimized for speed with parallel processing and batch operations.
 
         Args:
             polyhedrons_data: Data dictionary from process_voxel_grid
             output_path: Output file path (.vtp for single mesh, .vtm for multiblock)
             multiblock: If True, save as MultiBlock (.vtm), else as single PolyData (.vtp)
             include_z_depth: If True, add z-depth related data for coloring
+            fast_export: Use optimized export with parallel processing
+            export_batch_size: Number of polyhedrons to process in each batch
+            num_export_workers: Number of parallel workers (None = auto-detect)
         """
-        import pyvista as pv  # Ensure pv is available
+        import pyvista as pv
         from pathlib import Path
+        import concurrent.futures
+        from tqdm import tqdm
 
         print(f"Exporting polyhedrons to Paraview file: {output_path}")
+        if fast_export:
+            print("Using optimized fast export with parallel processing...")
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         polyhedrons = polyhedrons_data.get("polyhedrons", {})
@@ -2297,12 +2968,267 @@ class PolyhedronSegmentation:
             print("No polyhedrons to export.")
             return
 
+        # Determine optimal number of workers
+        if num_export_workers is None:
+            num_export_workers = min(len(polyhedrons), get_optimal_worker_count("mixed"))
+
+        if fast_export and len(polyhedrons) > 10:
+            # Use optimized parallel export
+            if multiblock:
+                self._save_to_paraview_multiblock_fast(
+                    polyhedrons, output_path, include_z_depth, export_batch_size, num_export_workers
+                )
+            else:
+                self._save_to_paraview_combined_fast(
+                    polyhedrons, output_path, include_z_depth, export_batch_size, num_export_workers
+                )
+        else:
+            # Use original method for small datasets or when fast_export is disabled
+            self._save_to_paraview_original(polyhedrons, output_path, multiblock, include_z_depth)
+
+    def _create_mesh_worker(self, poly_data_tuple):
+        """
+        Worker function for parallel mesh creation.
+
+        Args:
+            poly_data_tuple: (poly_id_str, poly_data, include_z_depth)
+
+        Returns:
+            (poly_id, mesh) or None if mesh creation failed
+        """
+        import pyvista as pv
+
+        poly_id_str, poly_data, include_z_depth = poly_data_tuple
+        poly_id = int(poly_id_str)
+
+        try:
+            vertices = np.array(poly_data.get("vertices", []))
+            faces_list = poly_data.get("faces", [])
+
+            if vertices.size == 0 or not faces_list:
+                return None
+
+            # Optimized face conversion using list comprehension
+            pv_faces = []
+            for face_indices in faces_list:
+                if len(face_indices) >= 3:
+                    pv_faces.extend([len(face_indices)] + face_indices)
+
+            if not pv_faces:
+                return None
+
+            mesh = pv.PolyData(vertices, np.asarray(pv_faces, dtype=np.int32))
+            if mesh.n_points == 0 or mesh.n_cells == 0:
+                return None
+
+            # Add data efficiently
+            mesh.point_data["poly_id"] = np.full(mesh.n_points, poly_id, dtype=np.int32)
+            mesh.cell_data["poly_id"] = np.full(mesh.n_cells, poly_id, dtype=np.int32)
+
+            # Add volume and voxel count data
+            volume = poly_data.get("volume", 0)
+            voxel_count = poly_data.get("voxel_count", 0)
+
+            mesh.field_data["volume"] = np.array([volume], dtype=np.float32)
+            mesh.field_data["voxel_count"] = np.array([voxel_count], dtype=np.int32)
+
+            # Add z-depth data if requested
+            if include_z_depth and vertices.size > 0:
+                # Vectorized z-coordinate operations
+                z_coords = vertices[:, 2].astype(np.float32)
+                z_min, z_max = np.min(z_coords), np.max(z_coords)
+                z_mean = np.mean(z_coords)
+                z_range = z_max - z_min
+
+                # Point data
+                mesh.point_data["z_coordinate"] = z_coords
+                mesh.point_data["z_min"] = np.full(mesh.n_points, z_min, dtype=np.float32)
+                mesh.point_data["z_max"] = np.full(mesh.n_points, z_max, dtype=np.float32)
+                mesh.point_data["z_mean"] = np.full(mesh.n_points, z_mean, dtype=np.float32)
+                mesh.point_data["z_range"] = np.full(mesh.n_points, z_range, dtype=np.float32)
+
+                # Cell data
+                mesh.cell_data["z_min"] = np.full(mesh.n_cells, z_min, dtype=np.float32)
+                mesh.cell_data["z_max"] = np.full(mesh.n_cells, z_max, dtype=np.float32)
+                mesh.cell_data["z_mean"] = np.full(mesh.n_cells, z_mean, dtype=np.float32)
+                mesh.cell_data["z_range"] = np.full(mesh.n_cells, z_range, dtype=np.float32)
+
+                # Field data
+                mesh.field_data["z_min"] = np.array([z_min], dtype=np.float32)
+                mesh.field_data["z_max"] = np.array([z_max], dtype=np.float32)
+                mesh.field_data["z_mean"] = np.array([z_mean], dtype=np.float32)
+                mesh.field_data["z_range"] = np.array([z_range], dtype=np.float32)
+
+            return (poly_id, mesh)
+
+        except Exception as e:
+            print(f"Error creating mesh for polyhedron {poly_id}: {e}")
+            return None
+
+    def _save_to_paraview_multiblock_fast(
+        self, polyhedrons: Dict, output_path: str, include_z_depth: bool, batch_size: int, num_workers: int
+    ):
+        """Fast parallel export for MultiBlock format."""
+        import pyvista as pv
+        from pathlib import Path
+        import concurrent.futures
+        from tqdm import tqdm
+
+        print(f"Fast MultiBlock export with {num_workers} workers...")
+
+        # Prepare data for parallel processing
+        poly_items = list(polyhedrons.items())
+
+        # Process in parallel batches
+        mb = pv.MultiBlock()
+        successful_exports = 0
+
+        if num_workers > 1 and len(poly_items) > 10:
+            # Parallel processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Create tasks
+                tasks = [(poly_id_str, poly_data, include_z_depth) for poly_id_str, poly_data in poly_items]
+
+                # Submit all tasks
+                futures = [executor.submit(self._create_mesh_worker, task) for task in tasks]
+
+                # Collect results with progress bar
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Creating meshes"
+                ):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            poly_id, mesh = result
+                            mb[str(poly_id)] = mesh
+                            successful_exports += 1
+                    except Exception as e:
+                        print(f"Error in parallel mesh creation: {e}")
+        else:
+            # Sequential processing with progress bar
+            for poly_id_str, poly_data in tqdm(poly_items, desc="Creating meshes"):
+                result = self._create_mesh_worker((poly_id_str, poly_data, include_z_depth))
+                if result is not None:
+                    poly_id, mesh = result
+                    mb[str(poly_id)] = mesh
+                    successful_exports += 1
+
+        if mb.n_blocks == 0:
+            print("No valid meshes to save in MultiBlock.")
+            return
+
+        # Save with optimized settings
+        out_path = Path(output_path)
+        if out_path.suffix.lower() != ".vtm":
+            out_path = out_path.with_suffix(".vtm")
+
+        print(f"Saving {successful_exports} meshes to MultiBlock file...")
+        mb.save(str(out_path), binary=True)
+        print(f"MultiBlock file saved to: {out_path}")
+
+    def _save_to_paraview_combined_fast(
+        self, polyhedrons: Dict, output_path: str, include_z_depth: bool, batch_size: int, num_workers: int
+    ):
+        """Fast parallel export for combined format."""
+        import pyvista as pv
+        from pathlib import Path
+        import concurrent.futures
+        from tqdm import tqdm
+
+        print(f"Fast combined export with {num_workers} workers...")
+
+        # Prepare data for parallel processing
+        poly_items = list(polyhedrons.items())
+        all_meshes = []
+        successful_exports = 0
+
+        if num_workers > 1 and len(poly_items) > 10:
+            # Parallel processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Create tasks
+                tasks = [(poly_id_str, poly_data, include_z_depth) for poly_id_str, poly_data in poly_items]
+
+                # Submit all tasks
+                futures = [executor.submit(self._create_mesh_worker, task) for task in tasks]
+
+                # Collect results with progress bar
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures), total=len(futures), desc="Creating meshes"
+                ):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            poly_id, mesh = result
+                            # Add additional data for combined mesh
+                            volume = polyhedrons[str(poly_id)].get("volume", 0)
+                            voxel_count = polyhedrons[str(poly_id)].get("voxel_count", 0)
+
+                            mesh.cell_data["volume"] = np.full(mesh.n_cells, volume, dtype=np.float32)
+                            mesh.cell_data["voxel_count"] = np.full(mesh.n_cells, voxel_count, dtype=np.int32)
+                            mesh.point_data["volume"] = np.full(mesh.n_points, volume, dtype=np.float32)
+                            mesh.point_data["voxel_count"] = np.full(mesh.n_points, voxel_count, dtype=np.int32)
+
+                            all_meshes.append(mesh)
+                            successful_exports += 1
+                    except Exception as e:
+                        print(f"Error in parallel mesh creation: {e}")
+        else:
+            # Sequential processing with progress bar
+            for poly_id_str, poly_data in tqdm(poly_items, desc="Creating meshes"):
+                result = self._create_mesh_worker((poly_id_str, poly_data, include_z_depth))
+                if result is not None:
+                    poly_id, mesh = result
+                    # Add additional data for combined mesh
+                    volume = poly_data.get("volume", 0)
+                    voxel_count = poly_data.get("voxel_count", 0)
+
+                    mesh.cell_data["volume"] = np.full(mesh.n_cells, volume, dtype=np.float32)
+                    mesh.cell_data["voxel_count"] = np.full(mesh.n_cells, voxel_count, dtype=np.int32)
+                    mesh.point_data["volume"] = np.full(mesh.n_points, volume, dtype=np.float32)
+                    mesh.point_data["voxel_count"] = np.full(mesh.n_points, voxel_count, dtype=np.int32)
+
+                    all_meshes.append(mesh)
+                    successful_exports += 1
+
+        if not all_meshes:
+            print("No polyhedrons to combine and export.")
+            return
+
+        print(f"Combining {len(all_meshes)} meshes...")
+        try:
+            # More efficient combining
+            combined_mesh = pv.MultiBlock(all_meshes).combine(merge_points=True, tolerance=1e-6)
+        except Exception as e:
+            print(f"Error combining meshes: {e}. Saving as MultiBlock instead.")
+            # Fallback to multiblock
+            mb_fallback = pv.MultiBlock()
+            for i, mesh in enumerate(all_meshes):
+                mb_fallback[f"poly_{i}"] = mesh
+            out_path_fallback = Path(output_path).with_suffix(".vtm")
+            mb_fallback.save(str(out_path_fallback), binary=True)
+            print(f"Saved as MultiBlock fallback to: {out_path_fallback}")
+            return
+
+        # Save combined mesh
+        out_path = Path(output_path)
+        if out_path.suffix.lower() != ".vtu":
+            out_path = out_path.with_suffix(".vtu")
+
+        print(f"Saving combined mesh with {successful_exports} polyhedrons...")
+        combined_mesh.save(str(out_path), binary=True)
+        print(f"Combined mesh saved to: {out_path}")
+
+    def _save_to_paraview_original(self, polyhedrons: Dict, output_path: str, multiblock: bool, include_z_depth: bool):
+        """Original export method (kept for compatibility)."""
+        import pyvista as pv
+        from pathlib import Path
+
         if multiblock:
             mb = pv.MultiBlock()
             for poly_id_str, poly_data in polyhedrons.items():
-                poly_id = int(poly_id_str)  # Ensure poly_id is int for field data
+                poly_id = int(poly_id_str)
                 vertices = np.array(poly_data.get("vertices", []))
-                faces_list = poly_data.get("faces", [])  # List of lists
+                faces_list = poly_data.get("faces", [])
 
                 if vertices.size == 0 or not faces_list:
                     continue
@@ -2319,37 +3245,30 @@ class PolyhedronSegmentation:
 
                 try:
                     mesh = pv.PolyData(vertices, np.asarray(pv_faces))
-                    if mesh.n_points > 0:  # Add field data only if mesh is valid
+                    if mesh.n_points > 0:
                         mesh.point_data["poly_id"] = np.full(mesh.n_points, poly_id, dtype=int)
                         mesh.cell_data["poly_id"] = np.full(mesh.n_cells, poly_id, dtype=int)
                         mesh.field_data["volume"] = np.array([poly_data.get("volume", 0)])
                         mesh.field_data["voxel_count"] = np.array([poly_data.get("voxel_count", 0)])
 
-                        # Add z-depth related data for coloring
                         if include_z_depth and vertices.size > 0:
-                            # Point data: z-coordinate of each vertex
-                            mesh.point_data["z_coordinate"] = vertices[:, 2]
-
-                            # Calculate z statistics for this polyhedron
                             z_coords = vertices[:, 2]
                             z_min = float(np.min(z_coords))
                             z_max = float(np.max(z_coords))
                             z_mean = float(np.mean(z_coords))
                             z_range = z_max - z_min
 
-                            # Cell data: uniform z statistics for all faces of this polyhedron
+                            mesh.point_data["z_coordinate"] = z_coords
                             mesh.cell_data["z_min"] = np.full(mesh.n_cells, z_min, dtype=float)
                             mesh.cell_data["z_max"] = np.full(mesh.n_cells, z_max, dtype=float)
                             mesh.cell_data["z_mean"] = np.full(mesh.n_cells, z_mean, dtype=float)
                             mesh.cell_data["z_range"] = np.full(mesh.n_cells, z_range, dtype=float)
 
-                            # Point data: z statistics repeated for each vertex
                             mesh.point_data["z_min"] = np.full(mesh.n_points, z_min, dtype=float)
                             mesh.point_data["z_max"] = np.full(mesh.n_points, z_max, dtype=float)
                             mesh.point_data["z_mean"] = np.full(mesh.n_points, z_mean, dtype=float)
                             mesh.point_data["z_range"] = np.full(mesh.n_points, z_range, dtype=float)
 
-                            # Field data: polyhedron-level z statistics
                             mesh.field_data["z_min"] = np.array([z_min])
                             mesh.field_data["z_max"] = np.array([z_max])
                             mesh.field_data["z_mean"] = np.array([z_mean])
@@ -2369,6 +3288,7 @@ class PolyhedronSegmentation:
             mb.save(str(out_path), binary=True)
             print(f"MultiBlock file saved to: {out_path}")
         else:
+            # Combined export logic (similar to above but for single file)
             all_meshes = []
             for poly_id_str, poly_data in polyhedrons.items():
                 poly_id = int(poly_id_str)
@@ -2392,8 +3312,6 @@ class PolyhedronSegmentation:
                     if mesh.n_points > 0:
                         mesh.point_data["poly_id"] = np.full(mesh.n_points, poly_id, dtype=int)
                         mesh.cell_data["poly_id"] = np.full(mesh.n_cells, poly_id, dtype=int)
-
-                        # Add polyhedron-specific data
                         mesh.cell_data["volume"] = np.full(mesh.n_cells, poly_data.get("volume", 0), dtype=float)
                         mesh.cell_data["voxel_count"] = np.full(
                             mesh.n_cells, poly_data.get("voxel_count", 0), dtype=int
@@ -2403,25 +3321,19 @@ class PolyhedronSegmentation:
                             mesh.n_points, poly_data.get("voxel_count", 0), dtype=int
                         )
 
-                        # Add z-depth related data for coloring
                         if include_z_depth and vertices.size > 0:
-                            # Point data: z-coordinate of each vertex
-                            mesh.point_data["z_coordinate"] = vertices[:, 2]
-
-                            # Calculate z statistics for this polyhedron
                             z_coords = vertices[:, 2]
                             z_min = float(np.min(z_coords))
                             z_max = float(np.max(z_coords))
                             z_mean = float(np.mean(z_coords))
                             z_range = z_max - z_min
 
-                            # Cell data: uniform z statistics for all faces of this polyhedron
+                            mesh.point_data["z_coordinate"] = z_coords
                             mesh.cell_data["z_min"] = np.full(mesh.n_cells, z_min, dtype=float)
                             mesh.cell_data["z_max"] = np.full(mesh.n_cells, z_max, dtype=float)
                             mesh.cell_data["z_mean"] = np.full(mesh.n_cells, z_mean, dtype=float)
                             mesh.cell_data["z_range"] = np.full(mesh.n_cells, z_range, dtype=float)
 
-                            # Point data: z statistics repeated for each vertex
                             mesh.point_data["z_min"] = np.full(mesh.n_points, z_min, dtype=float)
                             mesh.point_data["z_max"] = np.full(mesh.n_points, z_max, dtype=float)
                             mesh.point_data["z_mean"] = np.full(mesh.n_points, z_mean, dtype=float)
@@ -2436,30 +3348,226 @@ class PolyhedronSegmentation:
                 return
 
             try:
-                # Need to handle merging carefully if they have different point/cell data structures.
-                # A simple merge might lose some data or require uniform fields.
-                # For now, let's assume poly_id is the main distinguishing feature.
                 combined_mesh = pv.MultiBlock(all_meshes).combine(merge_points=True, tolerance=1e-05)
-                # If combine() doesn't preserve poly_id well across merged entities,
-                # an alternative is to save them as separate datasets in a .vtmb or .pvd file.
-                # Or, ensure 'poly_id' is correctly handled during combination.
             except Exception as e:
                 print(f"Error combining meshes: {e}. Saving as MultiBlock instead.")
-                # Fallback to multiblock if combine fails
                 mb_fallback = pv.MultiBlock()
                 for i, m in enumerate(all_meshes):
-                    mb_fallback[f"poly_{i}"] = m  # Use original poly_id if available and unique
+                    mb_fallback[f"poly_{i}"] = m
                 out_path_fallback = Path(output_path).with_suffix(".vtm")
                 mb_fallback.save(str(out_path_fallback), binary=True)
                 print(f"Combined PolyData save failed. Saved as MultiBlock to: {out_path_fallback}")
                 return
 
             out_path = Path(output_path)
-            # When saving a combined mesh (UnstructuredGrid), .vtu is the appropriate extension.
             if out_path.suffix.lower() != ".vtu":
                 out_path = out_path.with_suffix(".vtu")
             combined_mesh.save(str(out_path), binary=True)
             print(f"Combined UnstructuredGrid file saved to: {out_path}")
+
+    def _merge_chunk_results_ultra_fast(
+        self, chunk_results: List[Dict], grid_shape: Tuple[int, int, int], overlap: int
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Ultra-fast chunk merging with minimal overlap resolution for maximum performance.
+
+        Strategy: Prioritize speed over perfect overlap resolution.
+        Uses simple "first wins" strategy with minimal computation.
+        """
+        print(f"Ultra-fast merging {len(chunk_results)} chunk results...")
+
+        # Initialize full grid
+        full_labels = np.zeros(grid_shape, dtype=np.int32)
+        global_label_id = 1
+
+        # Sort chunks by number of labels (largest first for priority)
+        chunk_results = sorted(chunk_results, key=lambda x: x["num_labels"], reverse=True)
+
+        for i, chunk_result in enumerate(chunk_results):
+            if chunk_result["num_labels"] == 0:
+                continue
+
+            chunk_labels = chunk_result["labels"]
+            chunk_slice = chunk_result["chunk_slice"]
+
+            # Get unique labels in this chunk
+            unique_labels = np.unique(chunk_labels)
+            unique_labels = unique_labels[unique_labels > 0]  # Exclude background
+
+            if len(unique_labels) == 0:
+                continue
+
+            # Create simple 1:1 mapping - much faster than volume comparison
+            label_mapping = {old_label: global_label_id + j for j, old_label in enumerate(unique_labels)}
+            global_label_id += len(unique_labels)
+
+            # Apply mapping using numpy's advanced indexing - very fast
+            mapped_chunk = np.zeros_like(chunk_labels, dtype=np.int32)
+            for old_label, new_label in label_mapping.items():
+                mapped_chunk[chunk_labels == old_label] = new_label
+
+            # Simple assignment strategy: only fill empty regions
+            grid_region = full_labels[chunk_slice]
+            empty_mask = (grid_region == 0) & (mapped_chunk > 0)
+            grid_region[empty_mask] = mapped_chunk[empty_mask]
+
+        # Count final labels without compaction (much faster)
+        unique_final = np.unique(full_labels)
+        final_count = len(unique_final) - 1 if 0 in unique_final else len(unique_final)
+
+        print(f"Ultra-fast merge completed: {final_count} total labels")
+        return full_labels, final_count
+
+    def _early_filter_labels_in_chunks(
+        self,
+        labeled_grid: np.ndarray,
+        num_labels: int,
+        min_polyhedron_size: int,
+        remove_boundary_polyhedrons: bool,
+        max_voxel_aspect_ratio: Optional[float] = None,
+    ) -> Tuple[List[int], Dict]:
+        """
+        Perform early filtering to reduce the number of labels before expensive mesh extraction.
+        This can dramatically reduce processing time.
+        """
+        print(f"Early filtering {num_labels} labels...")
+
+        # Pre-compute label sizes for all labels at once (vectorized)
+        label_sizes = np.bincount(labeled_grid.ravel())
+
+        # Filter by minimum size (vectorized)
+        size_filtered_labels = np.where(label_sizes >= min_polyhedron_size)[0]
+        size_filtered_labels = size_filtered_labels[size_filtered_labels > 0]  # Remove background
+
+        print(f"Size filter: {len(size_filtered_labels)} labels remain after min size {min_polyhedron_size}")
+
+        # Filter boundary labels if requested
+        boundary_removed_count = 0
+        if remove_boundary_polyhedrons and len(size_filtered_labels) > 0:
+            print("Fast boundary detection...")
+            dims = labeled_grid.shape
+
+            # Use sets for fast boundary detection
+            boundary_labels = set()
+            boundary_labels.update(np.unique(labeled_grid[0, :, :]))  # Front Z
+            boundary_labels.update(np.unique(labeled_grid[-1, :, :]))  # Back Z
+            boundary_labels.update(np.unique(labeled_grid[:, 0, :]))  # Front Y
+            boundary_labels.update(np.unique(labeled_grid[:, -1, :]))  # Back Y
+            boundary_labels.update(np.unique(labeled_grid[:, :, 0]))  # Front X
+            boundary_labels.update(np.unique(labeled_grid[:, :, -1]))  # Back X
+            boundary_labels.discard(0)  # Remove background
+
+            # Filter out boundary labels using set operations (very fast)
+            boundary_filtered_labels = [label for label in size_filtered_labels if label not in boundary_labels]
+            boundary_removed_count = len(size_filtered_labels) - len(boundary_filtered_labels)
+            size_filtered_labels = boundary_filtered_labels
+
+            print(
+                f"Boundary filter: {len(size_filtered_labels)} labels remain after removing {boundary_removed_count} boundary labels"
+            )
+
+        # Fast aspect ratio filtering if requested
+        aspect_ratio_removed_count = 0
+        if max_voxel_aspect_ratio is not None and max_voxel_aspect_ratio > 0 and len(size_filtered_labels) > 0:
+            print(f"Fast aspect ratio filtering with threshold {max_voxel_aspect_ratio}...")
+
+            # Batch process aspect ratios
+            aspect_filtered_labels = []
+            for label_id in size_filtered_labels:
+                # Get bounding box efficiently
+                coords = np.argwhere(labeled_grid == label_id)
+                if len(coords) < 2:
+                    aspect_filtered_labels.append(label_id)
+                    continue
+
+                min_coords = np.min(coords, axis=0)
+                max_coords = np.max(coords, axis=0)
+                dims = max_coords - min_coords + 1
+                dims = np.maximum(dims, 1)
+                aspect_ratio = np.max(dims) / np.min(dims)
+
+                if aspect_ratio <= max_voxel_aspect_ratio:
+                    aspect_filtered_labels.append(label_id)
+                else:
+                    aspect_ratio_removed_count += 1
+
+            size_filtered_labels = aspect_filtered_labels
+            print(
+                f"Aspect ratio filter: {len(size_filtered_labels)} labels remain after removing {aspect_ratio_removed_count} high aspect ratio labels"
+            )
+
+        filter_stats = {
+            "boundary_removed_count": boundary_removed_count,
+            "aspect_ratio_removed_count": aspect_ratio_removed_count,
+            "final_filtered_count": len(size_filtered_labels),
+            "initial_size_filtered_count": len(np.where(label_sizes >= min_polyhedron_size)[0])
+            - 1,  # Count excludes background
+        }
+
+        return size_filtered_labels, filter_stats
+
+    def _stream_process_large_label_set(
+        self, labeled_grid: np.ndarray, label_ids: List[int], processing_params: Dict, max_batch_size: int = 50
+    ) -> List[Dict]:
+        """
+        Stream process large sets of labels in small batches to avoid memory issues.
+        """
+        # If max_batch_size is 0, process all labels in one batch (no streaming)
+        if max_batch_size <= 0:
+            max_batch_size = len(label_ids)
+            print(f"Stream batch size is 0, processing all {len(label_ids)} labels in one batch...")
+        else:
+            print(f"Stream processing {len(label_ids)} labels in batches of {max_batch_size}...")
+
+        all_results = []
+        num_batches = (len(label_ids) + max_batch_size - 1) // max_batch_size
+
+        for i in range(0, len(label_ids), max_batch_size):
+            batch_labels = label_ids[i : i + max_batch_size]
+            batch_num = i // max_batch_size + 1
+
+            print(f"Processing batch {batch_num}/{num_batches} ({len(batch_labels)} labels)...")
+
+            # Process this batch
+            if processing_params.get("fast_mesh_extraction", True):
+                batch_results = self._extract_polyhedrons_fast(
+                    labeled_grid,
+                    batch_labels,
+                    processing_params["smoothing_iterations"],
+                    processing_params["decimation_ratio"],
+                    processing_params["use_sdf"],
+                    processing_params["coordinate_validation_threshold"],
+                    min(processing_params["batch_mesh_size"], len(batch_labels)),
+                    processing_params["skip_sdf_for_small"],
+                    processing_params["small_polyhedron_threshold"],
+                    processing_params["reduce_smoothing_for_small"],
+                    processing_params["num_workers"],
+                )
+            else:
+                # Fallback to original method for this batch
+                batch_results = []
+                for label_id in batch_labels:
+                    polyhedron_size = np.sum(labeled_grid == label_id)
+                    mesh_data = self.extract_polyhedron_mesh(
+                        labeled_grid,
+                        label_id,
+                        processing_params["smoothing_iterations"],
+                        processing_params["decimation_ratio"],
+                        processing_params["use_sdf"],
+                        True,  # coordinate_sanity_check
+                        processing_params["coordinate_validation_threshold"],
+                    )
+                    if mesh_data and len(mesh_data.get("vertices", [])) > 0:
+                        batch_results.append({"polyhedron_size": polyhedron_size, **mesh_data})
+
+            all_results.extend(batch_results)
+
+            # Memory cleanup
+            import gc
+
+            gc.collect()
+
+        return all_results
 
 
 def main():
@@ -2573,6 +3681,24 @@ def main():
         default=True,
         help="Include z-depth data for coloring in Paraview exports (default: True). Adds z_coordinate, z_min, z_max, z_mean, z_range fields.",
     )
+    parser.add_argument(
+        "--fast-paraview-export",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fast parallel export for Paraview files (default: True). Significantly speeds up export.",
+    )
+    parser.add_argument(
+        "--export-batch-size",
+        type=int,
+        default=100,
+        help="Batch size for Paraview export processing (default: 100). Larger values use more memory but may be faster.",
+    )
+    parser.add_argument(
+        "--num-export-workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers for Paraview export (default: auto-detect based on CPU cores).",
+    )
 
     parser.add_argument(
         "--remove-boundary-polyhedrons",
@@ -2625,7 +3751,7 @@ def main():
         "--batch-mesh-size",
         type=int,
         default=10,
-        help="Batch size for fast mesh extraction (default: 10).",
+        help="Batch size for fast mesh extraction (default: 10). Set to 0 to process all polyhedrons in one batch.",
     )
     parser.add_argument(
         "--skip-sdf-for-small",
@@ -2636,7 +3762,7 @@ def main():
     parser.add_argument(
         "--small-polyhedron-threshold",
         type=int,
-        default=500,
+        default=1,
         help="Threshold for considering polyhedrons as 'small' for fast processing (default: 500 voxels).",
     )
     parser.add_argument(
@@ -2647,7 +3773,10 @@ def main():
     )
 
     parser.add_argument(
-        "--num-workers", type=int, default=os.cpu_count(), help="Number of parallel workers for mesh extraction"
+        "--num-workers",
+        type=int,
+        default=get_optimal_worker_count("cpu_intensive"),
+        help="Number of parallel workers for mesh extraction (for darwin apple silicon the power cores are different than efficeiency ones)",
     )
 
     # Chunking options for performance optimization
@@ -2678,11 +3807,61 @@ def main():
         default=True,
         help="Use fast chunk merging strategy for better performance (default: True). Use --no-fast-chunk-merge for detailed merging.",
     )
+    parser.add_argument(
+        "--ultra-fast-mode",
+        action="store_true",
+        help="Enable ultra-fast mode with aggressive optimizations for maximum speed (trades some accuracy for performance)",
+    )
+    parser.add_argument(
+        "--max-labels-threshold",
+        type=int,
+        default=5000,
+        help="Threshold for enabling aggressive optimizations when label count is high (default: 5000)",
+    )
+    parser.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=50,
+        help="Batch size for streaming processing of large label sets (default: 50). Set to 0 to disable streaming/batching entirely.",
+    )
+
+    # GPU acceleration options
+    parser.add_argument(
+        "--gpu-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="GPU backend to use for acceleration (default: auto). 'auto' selects the best available backend.",
+    )
+    parser.add_argument(
+        "--gpu-memory-fraction",
+        type=float,
+        default=0.8,
+        help="Fraction of GPU memory to use (0.1-0.9, default: 0.8). Only applies to CUDA backend.",
+    )
+    parser.add_argument(
+        "--min-size-for-gpu",
+        type=int,
+        default=500000000000000,
+        help="Minimum grid size (number of voxels) to trigger GPU acceleration (default: 1000000).",
+    )
+    parser.add_argument(
+        "--force-cpu",
+        action="store_true",
+        help="Force CPU-only processing, disabling all GPU acceleration.",
+    )
 
     args = parser.parse_args()
 
-    # Initialize segmentation
-    segmentation = PolyhedronSegmentation(voxel_spacing=tuple(args.voxel_spacing), origin=tuple(args.origin))
+    # Initialize segmentation with GPU options
+    gpu_backend = "cpu" if args.force_cpu else args.gpu_backend
+    segmentation = PolyhedronSegmentation(
+        voxel_spacing=tuple(args.voxel_spacing),
+        origin=tuple(args.origin),
+        gpu_backend=gpu_backend,
+        gpu_memory_fraction=args.gpu_memory_fraction,
+        min_size_for_gpu=args.min_size_for_gpu,
+    )
 
     # Load voxel grid
     print(f"Loading input grid: {args.input}")
@@ -2704,6 +3883,9 @@ def main():
             overlap=args.chunk_overlap,
             max_chunk_workers=args.max_chunk_workers,
             fast_merge=args.fast_chunk_merge,
+            ultra_fast_mode=args.ultra_fast_mode,
+            max_labels_threshold=args.max_labels_threshold,
+            stream_batch_size=args.stream_batch_size,
             # Pass all other parameters
             segmentation_method=args.method,
             min_polyhedron_size=args.min_polyhedron_size,
@@ -2797,6 +3979,9 @@ def main():
                 paraview_output_path,
                 multiblock=args.paraview_multiblock,
                 include_z_depth=args.include_z_depth,
+                fast_export=args.fast_paraview_export,
+                export_batch_size=args.export_batch_size,
+                num_export_workers=args.num_export_workers,
             )
 
         # Visualization
