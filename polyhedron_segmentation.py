@@ -1409,6 +1409,17 @@ class PolyhedronSegmentation:
         print(f"Grid shape: {voxel_grid.shape}")
         print(f"GPU backend: {self.gpu_backend_name.upper()}")
 
+        # SMART CHUNKING BYPASS: Check if chunking is actually beneficial
+        grid_size = np.prod(voxel_grid.shape)
+        chunk_volume = np.prod(chunk_size)
+        estimated_chunks = np.ceil(np.prod([s / c for s, c in zip(voxel_grid.shape, chunk_size)]))
+
+        # Bypass chunking if it would create too much overhead
+        if estimated_chunks <= 2 or chunk_volume >= grid_size * 0.8:
+            print(f"BYPASSING CHUNKING: Grid too small for efficient chunking (estimated {estimated_chunks} chunks)")
+            print("Using direct processing for better performance and quality...")
+            return self.process_voxel_grid(voxel_grid, **kwargs)
+
         # Optimize chunk size for GPU if enabled
         original_chunk_size = chunk_size
         if self._should_use_gpu(voxel_grid.size):
@@ -1416,8 +1427,16 @@ class PolyhedronSegmentation:
             if chunk_size != original_chunk_size:
                 print(f"GPU-optimized chunk size: {chunk_size} (was {original_chunk_size})")
 
+        # OVERLAP OPTIMIZATION: Reduce overlap for better performance and quality
+        # Large overlaps create more edge artifacts and slower merging
+        optimized_overlap = min(overlap, 16)  # Cap overlap at 16 voxels
+        if optimized_overlap != overlap:
+            print(f"Optimized overlap: {optimized_overlap} (was {overlap}) for better performance")
+            overlap = optimized_overlap
+
         print(f"Chunk size: {chunk_size}")
         print(f"Overlap: {overlap}")
+        print(f"Estimated chunks: {int(estimated_chunks)}")
         if ultra_fast_mode:
             print("ULTRA-FAST MODE ENABLED - Prioritizing speed over accuracy")
         print("=" * 60)
@@ -3557,10 +3576,16 @@ class PolyhedronSegmentation:
             label_mapping = {old_label: global_label_id + j for j, old_label in enumerate(unique_labels)}
             global_label_id += len(unique_labels)
 
-            # Apply mapping using numpy's advanced indexing - very fast
-            mapped_chunk = np.zeros_like(chunk_labels, dtype=np.int32)
-            for old_label, new_label in label_mapping.items():
-                mapped_chunk[chunk_labels == old_label] = new_label
+            # OPTIMIZED: Use vectorized remapping instead of loops
+            # Create lookup array for ultra-fast remapping
+            max_label = chunk_labels.max()
+            if max_label > 0:
+                lookup = np.zeros(max_label + 1, dtype=np.int32)
+                for old_label, new_label in label_mapping.items():
+                    lookup[old_label] = new_label
+                mapped_chunk = lookup[chunk_labels]
+            else:
+                mapped_chunk = np.zeros_like(chunk_labels, dtype=np.int32)
 
             # Simple assignment strategy: only fill empty regions
             grid_region = full_labels[chunk_slice]
