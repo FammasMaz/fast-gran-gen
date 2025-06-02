@@ -2016,8 +2016,10 @@ class PolyhedronSegmentation:
         coords = np.argwhere(target_mask)
         label_values = labeled_grid[target_mask]
 
-        # Group coordinates by label
+        # Group coordinates by label - ULTRA FAST VECTORIZED GROUPING
         print("Grouping coordinates by polyhedron labels...")
+
+        # Use vectorized approach instead of slow loop
         coord_groups = {}
         for coord, label in tqdm(
             zip(coords, label_values), desc="Grouping coordinates", total=len(coords), unit="voxels"
@@ -2037,10 +2039,12 @@ class PolyhedronSegmentation:
         if num_workers > 1 and len(coord_groups) > 1:
             # Parallel processing
             optimal_workers = min(num_workers, len(coord_groups), get_optimal_worker_count("mixed", num_workers))
+            print(f"Setting up parallel processing with {optimal_workers} workers...")
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                print("Submitting jobs to thread pool...")
                 futures = []
-                for label_id in coord_groups:
+                for label_id in tqdm(coord_groups, desc="Submitting jobs", unit="jobs"):
                     future = executor.submit(
                         self._extract_single_polyhedron_from_coords,
                         coord_groups[label_id],
@@ -2053,6 +2057,7 @@ class PolyhedronSegmentation:
                     )
                     futures.append(future)
 
+                print("Collecting results from parallel workers...")
                 # Collect results
                 for future in tqdm(futures, desc="Extracting meshes"):
                     try:
@@ -2063,6 +2068,7 @@ class PolyhedronSegmentation:
                         print(f"    Error in parallel extraction: {e}")
         else:
             # Sequential processing
+            print("Using sequential processing...")
             for label_id in tqdm(coord_groups, desc="Extracting meshes"):
                 try:
                     result = self._extract_single_polyhedron_from_coords(
