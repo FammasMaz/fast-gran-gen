@@ -2036,36 +2036,35 @@ class PolyhedronSegmentation:
         print(f"Processing {len(coord_groups)} polyhedrons with vectorized approach...")
 
         # Determine processing approach based on size and workers
-        if num_workers > 1 and len(coord_groups) > 1:
-            # Parallel processing
-            optimal_workers = min(num_workers, len(coord_groups), get_optimal_worker_count("mixed", num_workers))
-            print(f"Setting up parallel processing with {optimal_workers} workers...")
+        # BATCH PROCESSING: Avoid overwhelming ThreadPoolExecutor with too many jobs
+        batch_size = max(1, len(coord_groups) // (num_workers * 4))  # 4 batches per worker
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
-                print("Submitting jobs to thread pool...")
-                futures = []
-                for label_id in tqdm(coord_groups, desc="Submitting jobs", unit="jobs"):
-                    future = executor.submit(
-                        self._extract_single_polyhedron_from_coords,
-                        coord_groups[label_id],
-                        label_id,
-                        smoothing_iterations,
-                        decimation_ratio,
-                        use_sdf,
-                        coordinate_validation_threshold,
-                        fast_mode,
-                    )
-                    futures.append(future)
+        if num_workers > 1 and len(coord_groups) > batch_size:
+            print(f"Using batch processing: {len(coord_groups)} polyhedrons in batches of {batch_size}")
 
-                print("Collecting results from parallel workers...")
-                # Collect results
-                for future in tqdm(futures, desc="Extracting meshes"):
+            # Process in batches to avoid ThreadPoolExecutor overhead
+            label_ids = list(coord_groups.keys())
+
+            for batch_start in tqdm(range(0, len(label_ids), batch_size), desc="Processing batches", unit="batches"):
+                batch_end = min(batch_start + batch_size, len(label_ids))
+                batch_labels = label_ids[batch_start:batch_end]
+
+                # Process this batch sequentially (much faster than individual ThreadPool jobs)
+                for label_id in batch_labels:
                     try:
-                        result = future.result()
+                        result = self._extract_single_polyhedron_from_coords(
+                            coord_groups[label_id],
+                            label_id,
+                            smoothing_iterations,
+                            decimation_ratio,
+                            use_sdf,
+                            coordinate_validation_threshold,
+                            fast_mode,
+                        )
                         if result and len(result.get("vertices", [])) > 0:
                             all_results.append(result)
                     except Exception as e:
-                        print(f"    Error in parallel extraction: {e}")
+                        print(f"    Error extracting polyhedron {label_id}: {e}")
         else:
             # Sequential processing
             print("Using sequential processing...")
