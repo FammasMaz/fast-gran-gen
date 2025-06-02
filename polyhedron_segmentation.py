@@ -15,6 +15,12 @@ import time
 from tqdm import tqdm
 import concurrent.futures
 import warnings
+import sys
+
+if sys.platform == "darwin":
+    import multiprocessing
+
+    multiprocessing.set_start_method("spawn", force=True)
 
 
 def validate_mesh_coordinates(vertices: np.ndarray, label_id: int, max_reasonable_coord: float = 1e4) -> bool:
