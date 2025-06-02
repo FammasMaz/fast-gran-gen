@@ -3369,8 +3369,24 @@ class PolyhedronSegmentation:
         # Create mesh
         combined_mesh = pv.PolyData(combined_vertices, combined_faces)
 
-        # Add minimal essential data
+        # Add polyhedron ID data
         combined_mesh.point_data["poly_id"] = np.array(all_poly_ids, dtype=np.int32)
+
+        # Add z-coordinate data for height-based coloring
+        z_coords = combined_vertices[:, 2]  # Extract z coordinates
+        combined_mesh.point_data["z_coordinate"] = z_coords
+        combined_mesh.point_data["z_height"] = z_coords  # Alternative name for ParaView
+
+        # Add z statistics for enhanced visualization
+        z_min = float(np.min(z_coords))
+        z_max = float(np.max(z_coords))
+        z_mean = float(np.mean(z_coords))
+        z_range = z_max - z_min
+
+        combined_mesh.point_data["z_min"] = np.full(len(z_coords), z_min, dtype=float)
+        combined_mesh.point_data["z_max"] = np.full(len(z_coords), z_max, dtype=float)
+        combined_mesh.point_data["z_mean"] = np.full(len(z_coords), z_mean, dtype=float)
+        combined_mesh.point_data["z_range"] = np.full(len(z_coords), z_range, dtype=float)
 
         # Add cell data efficiently
         cell_poly_ids = []
@@ -3382,6 +3398,27 @@ class PolyhedronSegmentation:
                 cell_poly_ids.extend([poly_id] * num_faces)
 
         combined_mesh.cell_data["poly_id"] = np.array(cell_poly_ids, dtype=np.int32)
+
+        # Add z-coordinate data to cells as well for complete visualization
+        if len(cell_poly_ids) > 0:
+            # Calculate z statistics per cell (face)
+            cell_z_means = []
+            face_start = 0
+
+            for poly_id_str, poly_data in valid_polys:
+                if poly_data.get("vertices") and poly_data.get("faces"):
+                    vertices = np.array(poly_data["vertices"])
+                    faces = poly_data["faces"]
+
+                    for face_indices in faces:
+                        if len(face_indices) >= 3:
+                            # Get z coordinates for this face's vertices
+                            face_z_coords = vertices[face_indices, 2]
+                            cell_z_means.append(float(np.mean(face_z_coords)))
+
+            if cell_z_means:
+                combined_mesh.cell_data["z_coordinate"] = np.array(cell_z_means, dtype=float)
+                combined_mesh.cell_data["z_height"] = np.array(cell_z_means, dtype=float)
 
         # Save directly without expensive combining operations
         out_path = Path(output_path)
@@ -3395,6 +3432,10 @@ class PolyhedronSegmentation:
         combined_mesh.save(str(out_path), binary=True)
         print(f"Ultra-fast export completed: {out_path}")
         print(f"Note: Saved as .vtp format (PolyData) - compatible with ParaView")
+        print(f"Available data arrays for visualization:")
+        print(f"  - Point data: poly_id, z_coordinate, z_height, z_min, z_max, z_mean, z_range")
+        print(f"  - Cell data: poly_id, z_coordinate, z_height")
+        print(f"Tip: In ParaView, color by 'z_coordinate' or 'z_height' to see elevation-based coloring")
 
     def _save_to_paraview_original(self, polyhedrons: Dict, output_path: str, multiblock: bool, include_z_depth: bool):
         """Original export method (kept for compatibility)."""
