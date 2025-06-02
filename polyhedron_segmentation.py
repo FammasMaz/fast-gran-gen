@@ -375,19 +375,22 @@ _gpu_backend = GPUBackend()
 _gpu_ops = GPUAcceleratedOperations(_gpu_backend)
 
 
-def get_optimal_worker_count(task_type: str = "cpu_intensive") -> int:
+def get_optimal_worker_count(task_type: str = "cpu_intensive", num_workers: int = None) -> int:
     """
-    Get optimal number of workers based on system architecture.
-
-    For Apple Silicon Macs, this tries to detect P-core count for CPU-intensive tasks.
-    For other systems, falls back to CPU count with reasonable limits.
+    Get optimal number of workers based on args.num_workers or system architecture.
 
     Args:
         task_type: "cpu_intensive" for mesh processing, "mixed" for chunk processing
+        num_workers: Number of workers from args.num_workers (takes priority if provided)
 
     Returns:
         Optimal number of workers
     """
+    # If num_workers is explicitly provided, use it as the primary value
+    if num_workers is not None:
+        return num_workers
+
+    # Only fall back to CPU detection when num_workers is not provided
     total_cores = os.cpu_count()
 
     # Try to detect Apple Silicon and get P-core count
@@ -449,7 +452,6 @@ def get_optimal_worker_count(task_type: str = "cpu_intensive") -> int:
         # For mixed/I/O tasks, can use more workers
         optimal = total_cores
 
-    print(f"Using {optimal} workers (fallback strategy)")
     return optimal
 
 
@@ -1454,7 +1456,7 @@ class PolyhedronSegmentation:
         }
 
         # Step 4: Process chunks
-        chunk_workers = max_chunk_workers or min(len(chunks), get_optimal_worker_count("mixed"))
+        chunk_workers = max_chunk_workers or min(len(chunks), get_optimal_worker_count("mixed", None))
         chunk_results = []
 
         if chunk_workers > 1 and len(chunks) > 1:
@@ -1701,7 +1703,7 @@ class PolyhedronSegmentation:
             # Use original method
             if num_workers > 1 and len(label_ids_to_process) > 1:
                 # Optimize worker count for CPU-intensive mesh extraction
-                optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
+                optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive", num_workers))
                 print(f"Using {optimal_workers} parallel workers for mesh extraction...")
                 with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
                     futures = [
@@ -1978,7 +1980,7 @@ class PolyhedronSegmentation:
 
             if num_workers > 1 and len(batch) > 1:
                 # Parallel processing within batch - use ThreadPoolExecutor for I/O bound mesh operations
-                optimal_batch_workers = min(num_workers, len(batch), get_optimal_worker_count("mixed"))
+                optimal_batch_workers = min(num_workers, len(batch), get_optimal_worker_count("mixed", num_workers))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_batch_workers) as executor:
                     futures = []
                     for label_id, polyhedron_size in batch:
@@ -2502,7 +2504,7 @@ class PolyhedronSegmentation:
 
         if fast_mesh_extraction:
             # Use optimized batch processing with optimal worker count
-            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
+            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive", num_workers))
             candidate_polyhedron_mesh_data_list = self._extract_polyhedrons_fast(
                 labeled_grid,
                 label_ids_to_process,
@@ -2518,7 +2520,7 @@ class PolyhedronSegmentation:
             )
         elif num_workers > 1 and len(label_ids_to_process) > 1:
             # Optimize worker count for CPU-intensive mesh extraction
-            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive"))
+            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive", num_workers))
             print(f"Using {optimal_workers} parallel workers for mesh extraction...")
             with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
                 futures = [
@@ -2970,7 +2972,7 @@ class PolyhedronSegmentation:
 
         # Determine optimal number of workers
         if num_export_workers is None:
-            num_export_workers = min(len(polyhedrons), get_optimal_worker_count("mixed"))
+            num_export_workers = min(len(polyhedrons), get_optimal_worker_count("mixed", None))
 
         if fast_export and len(polyhedrons) > 10:
             # Use optimized parallel export
@@ -3775,7 +3777,7 @@ def main():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=get_optimal_worker_count("cpu_intensive"),
+        default=None,  # Will use get_optimal_worker_count() fallback logic if not specified
         help="Number of parallel workers for mesh extraction (for darwin apple silicon the power cores are different than efficeiency ones)",
     )
 
