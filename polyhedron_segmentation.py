@@ -1899,55 +1899,22 @@ class PolyhedronSegmentation:
         """
         print(f"Starting fast mesh extraction for {len(label_ids)} polyhedrons")
 
-        # Group polyhedrons by size for differential processing
-        small_polyhedrons = []
-        large_polyhedrons = []
+        # Direct processing without unnecessary size-based sorting
+        # Create simple list of (label_id, 0) tuples since size isn't needed for processing
+        polyhedron_list = [(label_id, 0) for label_id in label_ids]
 
-        for label_id in label_ids:
-            polyhedron_size = np.sum(labeled_grid == label_id)
-            if polyhedron_size < small_threshold:
-                small_polyhedrons.append((label_id, polyhedron_size))
-            else:
-                large_polyhedrons.append((label_id, polyhedron_size))
-
-        print(f"  Small polyhedrons (< {small_threshold} voxels): {len(small_polyhedrons)}")
-        print(f"  Large polyhedrons (>= {small_threshold} voxels): {len(large_polyhedrons)}")
-
-        results = []
-
-        # Process small polyhedrons with optimizations
-        if small_polyhedrons:
-            print(f"Processing {len(small_polyhedrons)} small polyhedrons with optimizations...")
-            small_results = self._extract_polyhedrons_batch(
-                labeled_grid,
-                small_polyhedrons,
-                smoothing_iterations=max(1, smoothing_iterations // 3)
-                if reduce_smoothing_for_small
-                else smoothing_iterations,
-                decimation_ratio=max(0.5, decimation_ratio),  # More aggressive decimation for small ones
-                use_sdf=False if skip_sdf_for_small else use_sdf,  # Skip SDF for small polyhedrons
-                coordinate_validation_threshold=coordinate_validation_threshold,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                fast_mode=True,
-            )
-            results.extend(small_results)
-
-        # Process large polyhedrons normally but in batches
-        if large_polyhedrons:
-            print(f"Processing {len(large_polyhedrons)} large polyhedrons with normal quality...")
-            large_results = self._extract_polyhedrons_batch(
-                labeled_grid,
-                large_polyhedrons,
-                smoothing_iterations=smoothing_iterations,
-                decimation_ratio=decimation_ratio,
-                use_sdf=use_sdf,
-                coordinate_validation_threshold=coordinate_validation_threshold,
-                batch_size=max(1, batch_size // 2),  # Smaller batches for large polyhedrons
-                num_workers=num_workers,
-                fast_mode=False,
-            )
-            results.extend(large_results)
+        # Process all polyhedrons with consistent settings
+        results = self._extract_polyhedrons_batch(
+            labeled_grid,
+            polyhedron_list,
+            smoothing_iterations=smoothing_iterations,
+            decimation_ratio=decimation_ratio,
+            use_sdf=use_sdf,
+            coordinate_validation_threshold=coordinate_validation_threshold,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            fast_mode=False,
+        )
 
         print(f"Fast mesh extraction completed. Processed {len(results)} polyhedrons successfully.")
         return results
