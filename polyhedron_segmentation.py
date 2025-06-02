@@ -2585,11 +2585,22 @@ class PolyhedronSegmentation:
 
         # First, filter by minimum size
         print("  - Filtering by minimum size...")
+
+        # VECTORIZED SIZE FILTERING: Much faster than individual np.sum operations
+        unique_labels, label_counts = np.unique(labeled_grid, return_counts=True)
+
+        # Create a mapping from label to count, excluding background (label 0)
+        label_to_count = {}
+        for label, count in zip(unique_labels, label_counts):
+            if label > 0:  # Skip background
+                label_to_count[label] = count
+
+        # Filter labels that meet minimum size requirement
         candidate_label_ids = [
-            label_id
-            for label_id in tqdm(range(1, num_labels + 1), desc="Size filtering", unit="polyhedrons")
-            if np.sum(labeled_grid == label_id) >= min_polyhedron_size
+            label_id for label_id in label_to_count if label_to_count[label_id] >= min_polyhedron_size
         ]
+
+        print(f"    Vectorized size filtering completed: {len(candidate_label_ids)}/{len(label_to_count)} labels kept")
         print(
             f"Labels remaining after min_polyhedron_size ({min_polyhedron_size} voxels) filter: {len(candidate_label_ids)}"
         )
