@@ -3310,88 +3310,91 @@ class PolyhedronSegmentation:
         import concurrent.futures
         from tqdm import tqdm
 
-        print(f"Fast combined export with {num_workers} workers...")
+        print(f"ULTRA-FAST export bypassing individual mesh creation...")
 
-        # Prepare data for parallel processing
-        poly_items = list(polyhedrons.items())
-        all_meshes = []
+        # OPTIMIZATION: Skip individual mesh creation and combine directly
+        # Pre-allocate arrays for massive performance gain
+        all_vertices = []
+        all_faces = []
+        all_poly_ids = []
+        vertex_offset = 0
         successful_exports = 0
 
-        if num_workers > 1 and len(poly_items) > 10:
-            # Parallel processing
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Create tasks
-                tasks = [(poly_id_str, poly_data, include_z_depth) for poly_id_str, poly_data in poly_items]
+        # Filter valid polyhedrons first
+        valid_polys = [
+            (poly_id_str, poly_data)
+            for poly_id_str, poly_data in polyhedrons.items()
+            if poly_data.get("vertices") and poly_data.get("faces")
+        ]
 
-                # Submit all tasks
-                futures = [executor.submit(self._create_mesh_worker, task) for task in tasks]
+        print(f"Processing {len(valid_polys)} valid polyhedrons for direct combination...")
 
-                # Collect results with progress bar
-                for future in tqdm(
-                    concurrent.futures.as_completed(futures), total=len(futures), desc="Creating meshes"
-                ):
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            poly_id, mesh = result
-                            # Add additional data for combined mesh
-                            volume = polyhedrons[str(poly_id)].get("volume", 0)
-                            voxel_count = polyhedrons[str(poly_id)].get("voxel_count", 0)
+        # Direct data aggregation without individual mesh objects
+        for poly_id_str, poly_data in tqdm(valid_polys, desc="Aggregating geometry"):
+            try:
+                poly_id = int(poly_id_str)
+                vertices = np.array(poly_data["vertices"], dtype=np.float32)
+                faces_list = poly_data["faces"]
 
-                            mesh.cell_data["volume"] = np.full(mesh.n_cells, volume, dtype=np.float32)
-                            mesh.cell_data["voxel_count"] = np.full(mesh.n_cells, voxel_count, dtype=np.int32)
-                            mesh.point_data["volume"] = np.full(mesh.n_points, volume, dtype=np.float32)
-                            mesh.point_data["voxel_count"] = np.full(mesh.n_points, voxel_count, dtype=np.int32)
+                if vertices.size == 0 or not faces_list:
+                    continue
 
-                            all_meshes.append(mesh)
-                            successful_exports += 1
-                    except Exception as e:
-                        print(f"Error in parallel mesh creation: {e}")
-        else:
-            # Sequential processing with progress bar
-            for poly_id_str, poly_data in tqdm(poly_items, desc="Creating meshes"):
-                result = self._create_mesh_worker((poly_id_str, poly_data, include_z_depth))
-                if result is not None:
-                    poly_id, mesh = result
-                    # Add additional data for combined mesh
-                    volume = poly_data.get("volume", 0)
-                    voxel_count = poly_data.get("voxel_count", 0)
+                # Add vertices directly
+                all_vertices.append(vertices)
 
-                    mesh.cell_data["volume"] = np.full(mesh.n_cells, volume, dtype=np.float32)
-                    mesh.cell_data["voxel_count"] = np.full(mesh.n_cells, voxel_count, dtype=np.int32)
-                    mesh.point_data["volume"] = np.full(mesh.n_points, volume, dtype=np.float32)
-                    mesh.point_data["voxel_count"] = np.full(mesh.n_points, voxel_count, dtype=np.int32)
+                # Process faces with offset
+                for face_indices in faces_list:
+                    if len(face_indices) >= 3:
+                        # Convert to PyVista format with vertex offset
+                        pv_face = [len(face_indices)] + [idx + vertex_offset for idx in face_indices]
+                        all_faces.extend(pv_face)
 
-                    all_meshes.append(mesh)
-                    successful_exports += 1
+                # Track which polyhedron each vertex belongs to
+                all_poly_ids.extend([poly_id] * len(vertices))
+                vertex_offset += len(vertices)
+                successful_exports += 1
 
-        if not all_meshes:
-            print("No polyhedrons to combine and export.")
+            except Exception as e:
+                print(f"Error processing polyhedron {poly_id_str}: {e}")
+
+        if not all_vertices:
+            print("No valid polyhedrons to export.")
             return
 
-        print(f"Combining {len(all_meshes)} meshes...")
-        try:
-            # More efficient combining
-            combined_mesh = pv.MultiBlock(all_meshes).combine(merge_points=True, tolerance=1e-6)
-        except Exception as e:
-            print(f"Error combining meshes: {e}. Saving as MultiBlock instead.")
-            # Fallback to multiblock
-            mb_fallback = pv.MultiBlock()
-            for i, mesh in enumerate(all_meshes):
-                mb_fallback[f"poly_{i}"] = mesh
-            out_path_fallback = Path(output_path).with_suffix(".vtm")
-            mb_fallback.save(str(out_path_fallback), binary=True)
-            print(f"Saved as MultiBlock fallback to: {out_path_fallback}")
-            return
+        # Create single combined mesh directly
+        print(f"Creating combined mesh from {successful_exports} polyhedrons...")
+        combined_vertices = np.vstack(all_vertices)
+        combined_faces = np.array(all_faces, dtype=np.int32)
 
-        # Save combined mesh
+        # Create mesh
+        combined_mesh = pv.PolyData(combined_vertices, combined_faces)
+
+        # Add minimal essential data
+        combined_mesh.point_data["poly_id"] = np.array(all_poly_ids, dtype=np.int32)
+
+        # Add cell data efficiently
+        cell_poly_ids = []
+        face_idx = 0
+        for poly_id_str, poly_data in valid_polys:
+            if poly_data.get("vertices") and poly_data.get("faces"):
+                poly_id = int(poly_id_str)
+                num_faces = len(poly_data["faces"])
+                cell_poly_ids.extend([poly_id] * num_faces)
+
+        combined_mesh.cell_data["poly_id"] = np.array(cell_poly_ids, dtype=np.int32)
+
+        # Save directly without expensive combining operations
         out_path = Path(output_path)
-        if out_path.suffix.lower() != ".vtu":
-            out_path = out_path.with_suffix(".vtu")
+        # Use .vtp format for PolyData (VTK PolyData format)
+        if out_path.suffix.lower() == ".vtu":
+            out_path = out_path.with_suffix(".vtp")
+        elif out_path.suffix.lower() not in [".vtp", ".ply", ".stl", ".vtk", ".obj"]:
+            out_path = out_path.with_suffix(".vtp")
 
-        print(f"Saving combined mesh with {successful_exports} polyhedrons...")
+        print(f"Saving ultra-fast combined mesh with {successful_exports} polyhedrons...")
         combined_mesh.save(str(out_path), binary=True)
-        print(f"Combined mesh saved to: {out_path}")
+        print(f"Ultra-fast export completed: {out_path}")
+        print(f"Note: Saved as .vtp format (PolyData) - compatible with ParaView")
 
     def _save_to_paraview_original(self, polyhedrons: Dict, output_path: str, multiblock: bool, include_z_depth: bool):
         """Original export method (kept for compatibility)."""
