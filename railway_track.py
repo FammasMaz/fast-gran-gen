@@ -587,11 +587,11 @@ def create_railway_track(
     model_path,
     inpainting_model_path,
     output_dir,
-    target_volume,  # (length, width, height) in real units
+    target_volume,  # (depth, width, length) in real units
     base_volume=(0.1, 0.3, 0.3),  # Volume represented by a single (32, 64, 64) voxel grid
     overlap_d=8,
-    overlap_h=8,
     overlap_w=8,
+    overlap_l=8,
     scheduler_type="ddim",
     **kwargs,
 ):
@@ -608,18 +608,18 @@ def create_railway_track(
         return None
 
     # Calculate how many grids needed in each dimension
-    target_length, target_width, target_height = target_volume
-    base_length, base_width, base_height = base_volume
+    target_depth, target_width, target_length = target_volume
+    base_depth, base_width, base_length = base_volume
 
-    grids_length = int(np.ceil(target_length / base_length))
+    grids_depth = int(np.ceil(target_depth / base_depth))
     grids_width = int(np.ceil(target_width / base_width))
-    grids_height = int(np.ceil(target_height / base_height))
+    grids_length = int(np.ceil(target_length / base_length))
 
     print(f"Target volume: {target_volume}")
     print(f"Base volume per grid: {base_volume}")
-    print(f"Grids needed: {grids_length} x {grids_width} x {grids_height}")
+    print(f"Grids needed: {grids_depth} x {grids_width} x {grids_length}")
 
-    if grids_length == 1 and grids_width == 1 and grids_height == 1:
+    if grids_depth == 1 and grids_width == 1 and grids_length == 1:
         # Single block case
         print("Single block case - using simple generation")
         args = argparse.Namespace(**kwargs)
@@ -628,16 +628,16 @@ def create_railway_track(
         )
         return volumes[0] if volumes else None
 
-    elif grids_width == 1 and grids_height == 1:
-        # 1D case (length only)
-        print("1D case - extending along length")
+    elif grids_width == 1 and grids_length == 1:
+        # 1D case (depth only)
+        print("1D case - extending along depth")
         return create_railway_track_1d(
             unet=unet,
             scheduler=scheduler,
             inpainting_pipeline=inpainting_pipeline,
             device=device,
             output_dir=output_dir,
-            n_blocks_length=grids_length,
+            n_blocks_length=grids_depth,
             overlap=overlap_d,
             **kwargs,
         )
@@ -650,12 +650,12 @@ def create_railway_track(
             inpainting_pipeline=inpainting_pipeline,
             device=device,
             output_dir=output_dir,
-            grids_length=grids_length,
+            grids_length=grids_depth,
             grids_width=grids_width,
-            grids_height=grids_height,
+            grids_height=grids_length,
             overlap_d=overlap_d,
-            overlap_h=overlap_h,
-            overlap_w=overlap_w,
+            overlap_h=overlap_w,
+            overlap_w=overlap_l,
             **kwargs,
         )
 
@@ -675,29 +675,27 @@ def main():
     )
 
     # Target dimensions
-    parser.add_argument(
-        "--target_length", type=float, required=True, help="Target length of railway track (real units)"
-    )
+    parser.add_argument("--target_depth", type=float, required=True, help="Target depth of railway track (real units)")
     parser.add_argument("--target_width", type=float, required=True, help="Target width of railway track (real units)")
     parser.add_argument(
-        "--target_height", type=float, required=True, help="Target height of railway track (real units)"
+        "--target_length", type=float, required=True, help="Target length of railway track (real units)"
     )
 
     # Base unit dimensions (defaults match your description)
     parser.add_argument(
-        "--base_length", type=float, default=0.1, help="Length represented by single voxel grid (default: 0.1)"
+        "--base_depth", type=float, default=0.1, help="Depth represented by single voxel grid (default: 0.1)"
     )
     parser.add_argument(
         "--base_width", type=float, default=0.3, help="Width represented by single voxel grid (default: 0.3)"
     )
     parser.add_argument(
-        "--base_height", type=float, default=0.3, help="Height represented by single voxel grid (default: 0.3)"
+        "--base_length", type=float, default=0.3, help="Length represented by single voxel grid (default: 0.3)"
     )
 
     # Overlap/gap parameters
-    parser.add_argument("--overlap_d", type=int, default=8, help="Gap size along depth/length dimension (default: 8)")
-    parser.add_argument("--overlap_h", type=int, default=8, help="Gap size along height dimension (default: 8)")
+    parser.add_argument("--overlap_d", type=int, default=8, help="Gap size along depth dimension (default: 8)")
     parser.add_argument("--overlap_w", type=int, default=8, help="Gap size along width dimension (default: 8)")
+    parser.add_argument("--overlap_l", type=int, default=8, help="Gap size along length dimension (default: 8)")
 
     # Generation parameters
     parser.add_argument("--scheduler_type", choices=["ddpm", "ddim"], default="ddim", help="Choose sampling scheduler")
@@ -769,8 +767,8 @@ def main():
     print(f"Output will be saved to: {output_dir}")
 
     # Define target and base volumes
-    target_volume = (args.target_length, args.target_width, args.target_height)
-    base_volume = (args.base_length, args.base_width, args.base_height)
+    target_volume = (args.target_depth, args.target_width, args.target_length)
+    base_volume = (args.base_depth, args.base_width, args.base_length)
 
     # Generate railway track
     start_time = time.time()
@@ -782,8 +780,8 @@ def main():
         target_volume=target_volume,
         base_volume=base_volume,
         overlap_d=args.overlap_d,
-        overlap_h=args.overlap_h,
         overlap_w=args.overlap_w,
+        overlap_l=args.overlap_l,
         scheduler_type=args.scheduler_type,
         inference_steps=args.inference_steps,
         seed=args.seed,
@@ -809,7 +807,7 @@ def main():
     if args.output_name:
         base_name = args.output_name
     else:
-        base_name = f"railway_track_{args.target_length}x{args.target_width}x{args.target_height}_{args.seed}"
+        base_name = f"railway_track_{args.target_depth}x{args.target_width}x{args.target_length}_{args.seed}"
 
     # Save in requested formats
     if args.save_format in ["npy", "both"]:
