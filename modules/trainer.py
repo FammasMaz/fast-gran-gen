@@ -695,6 +695,15 @@ class Trainer:
             num_samples = 4
             num_inference_steps = self.args.timesteps
 
+            # Debug: Check inpainting mode
+            has_inpainting_mode = hasattr(unwrapped_model.config, "inpainting_mode")
+            inpainting_mode_value = (
+                getattr(unwrapped_model.config, "inpainting_mode", None) if has_inpainting_mode else None
+            )
+            print(
+                f"[DEBUG] Epoch {epoch + 1}: Generating samples - inpainting_mode exists: {has_inpainting_mode}, value: {inpainting_mode_value}, use_2d_unet: {self.use_2d_unet}"
+            )
+
             # Determine shape from model config or dataset/args
             if self.use_2d_unet:
                 # For 2D UNet, D is treated as channels. Sample size is (H, W).
@@ -1252,25 +1261,90 @@ class Trainer:
                 for vol in processed_volumes_01:
                     proj = np.max(vol, axis=0)
                     generated_projections_np.append(proj)
+                print(
+                    f"[DEBUG] Epoch {epoch + 1}: Created {len(generated_projections_np)} projections from {len(processed_volumes_01)} volumes"
+                )
+            else:
+                print(f"[DEBUG] Epoch {epoch + 1}: No processed_volumes_01 available for projections")
 
             if self.args.logger == "wandb":
                 try:
                     # Log generated projections as grayscale images
                     if generated_projections_np:
-                        wandb.log(
-                            {
-                                f"generated_proj_{i}": wandb.Image(
-                                    proj, caption=f"Epoch {epoch + 1}: Generated Projection {i}"
-                                )
-                                for i, proj in enumerate(generated_projections_np)
-                            },
-                            commit=False,
+                        mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
+                        log_dict = {}
+
+                        # Log individual projections
+                        for i, proj in enumerate(generated_projections_np):
+                            log_dict[f"generated_proj_{i}_{mode_label.lower()}"] = wandb.Image(
+                                proj, caption=f"Epoch {epoch + 1}: {mode_label} Generated Projection {i}"
+                            )
+
+                        # For unconditional generation, also log a grid view
+                        if not is_inpainting_unet and len(generated_projections_np) > 1:
+                            # Create a grid of all projections
+                            import matplotlib.pyplot as plt
+
+                            fig, axes = plt.subplots(
+                                1, len(generated_projections_np), figsize=(len(generated_projections_np) * 3, 3)
+                            )
+                            if len(generated_projections_np) == 1:
+                                axes = [axes]
+                            fig.suptitle(f"Epoch {epoch + 1}: Unconditional Generation Grid")
+
+                            for i, (ax, proj) in enumerate(zip(axes, generated_projections_np)):
+                                ax.imshow(proj, cmap="gray", vmin=0, vmax=1)
+                                ax.set_title(f"Sample {i + 1}")
+                                ax.axis("off")
+
+                            plt.tight_layout()
+                            log_dict["unconditional_generation_grid"] = wandb.Image(plt)
+                            plt.close(fig)
+
+                        wandb.log(log_dict, commit=False)
+                        print(
+                            f"Successfully logged {len(generated_projections_np)} {mode_label.lower()} projections to WandB"
                         )
+
+                    # Log inpainting comparison if available
+                    if is_inpainting_unet and masked_input_slices and generated_projections_np:
+                        try:
+                            inpainting_comparisons = {}
+                            for i in range(min(len(masked_input_slices), len(generated_projections_np))):
+                                # Create side-by-side comparison
+                                import matplotlib.pyplot as plt
+
+                                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
+
+                                ax1.imshow(masked_input_slices[i])
+                                ax1.set_title("Masked Input")
+                                ax1.axis("off")
+
+                                ax2.imshow(generated_projections_np[i], cmap="gray", vmin=0, vmax=1)
+                                ax2.set_title("Generated Output")
+                                ax2.axis("off")
+
+                                plt.suptitle(f"Inpainting Comparison {i}")
+                                plt.tight_layout()
+
+                                inpainting_comparisons[f"inpainting_comparison_{i}"] = wandb.Image(plt)
+                                plt.close(fig)
+
+                            if inpainting_comparisons:
+                                wandb.log(inpainting_comparisons, commit=False)
+                                print(
+                                    f"Successfully logged {len(inpainting_comparisons)} inpainting comparisons to WandB"
+                                )
+                        except Exception as e:
+                            print(f"Error creating inpainting comparisons for WandB: {e}")
 
                     wandb.log({"epoch": epoch})
 
                 except Exception as e:
                     print(f"WandB image projection logging failed: {str(e)}")
+                    import traceback
+
+                    traceback.print_exc()
             elif self.args.logger == "tensorboard" and self.summary_writer:
                 try:
                     # Log generated projections (needs channel dim: NCHW)
@@ -1295,6 +1369,7 @@ class Trainer:
             # Create plot (for Telegram) - keep this regardless of logger
             # For inpainting, show both input context and results side by side using projections
             try:
+                # Always create visualization regardless of inpainting mode
                 if is_inpainting_unet and masked_input_slices:
                     print(
                         f"Matplotlib plotting projections: num_samples={num_samples}, masked_input_slices length={len(masked_input_slices)}"
@@ -1319,43 +1394,51 @@ class Trainer:
                             axs[1, i].axis("off")
                         else:
                             print(f"Warning: Index {i} out of range for projections")
+                elif generated_projections_np:
+                    # Standard visualization - ensure this always runs for unconditional generation
+                    fig, axs = plt.subplots(1, num_samples, figsize=(num_samples * 3, 3))
+                    mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
+                    fig.suptitle(f"Epoch {epoch + 1} Generated Projections ({mode_label})")
+
+                    if num_samples == 1:
+                        axs = np.array([axs])
+
+                    for i in range(num_samples):
+                        if i < len(generated_projections_np):
+                            proj_np = generated_projections_np[i]
+                            axs[i].imshow(proj_np, cmap="gray", vmin=0, vmax=1)
+                            axs[i].set_title(f"Sample {i + 1}")
+                            axs[i].axis("off")
+                        else:
+                            print(f"Warning: Index {i} out of range for generated_projections_np")
                 else:
-                    # Standard visualization
-                    if generated_projections_np:
-                        fig, axs = plt.subplots(1, num_samples, figsize=(num_samples * 3, 3))
-                        fig.suptitle(f"Epoch {epoch + 1} Generated Projections")
+                    print("Warning: No generated projections available for visualization")
+                    plt.close("all")  # Close any potentially open figures
+                    return processed_volumes_01, original_vti_processed, masked_vti_processed
 
-                        if num_samples == 1:
-                            axs = np.array([axs])
+                # Only proceed with saving/sending if we have a figure
+                if "fig" in locals() and fig is not None:
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+                    plt.close(fig)
 
-                        for i in range(num_samples):
-                            if i < len(generated_projections_np):
-                                proj_np = generated_projections_np[i]
-                                axs[i].imshow(proj_np, cmap="gray", vmin=0, vmax=1)
-                                axs[i].axis("off")
-                            else:
-                                print(f"Warning: Index {i} out of range for generated_projections_np")
-                    else:
-                        plt.close("all")  # Close any potentially open figures
-                        fig = None  # Indicate no figure was created
-                        buf = None
-                        return processed_volumes_01, original_vti_processed, masked_vti_processed
+                    buf.seek(0)
 
-                buf = io.BytesIO()
-                plt.savefig(buf, format="png")
-                plt.close(fig)
+                    # Send the raw bytes from the buffer via telegram
+                    if not self.disable_telegram:
+                        try:
+                            mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
+                            notifier.send_image(
+                                buf.getvalue(), caption=f"Epoch {epoch + 1} Generated Projections ({mode_label})"
+                            )
+                        except Exception as e:
+                            self.accelerator.print(f"Failed to send Telegram image: {e}")
 
-                buf.seek(0)
+                    # close the buffer
+                    buf.close()
+                else:
+                    print("No figure was created for visualization")
 
-                # Send the raw bytes from the buffer via telegram
-                if not self.disable_telegram:
-                    try:
-                        notifier.send_image(buf.getvalue(), caption=f"Epoch {epoch + 1} Generated Projections")
-                    except Exception as e:
-                        self.accelerator.print(f"Failed to send Telegram image: {e}")
-
-                # close the buffer
-                buf.close()
             except Exception as e:
                 self.accelerator.print(f"Error creating visualization plot: {e}")
                 import traceback
