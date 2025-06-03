@@ -57,9 +57,9 @@ class Trainer:
         )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.args.diffusion_lr, weight_decay=1e-5)
 
-        warmup_epochs = 5
+        warmup_epochs = 50
         scheduler1 = LinearLR(self.optimizer, start_factor=0.1, total_iters=warmup_epochs)
-        scheduler2 = CosineAnnealingLR(self.optimizer, T_max=self.args.epochs - warmup_epochs, eta_min=1e-6)
+        scheduler2 = CosineAnnealingLR(self.optimizer, T_max=self.args.epochs - warmup_epochs, eta_min=1e-5)
         self.scheduler = SequentialLR(self.optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
 
         if self.args.accelerator:
@@ -1269,31 +1269,42 @@ class Trainer:
 
             if self.args.logger == "wandb":
                 try:
-                    # Log generated projections as grayscale images
-                    if generated_projections_np:
+                    # Log generated images as grayscale - projections for inpainting, middle slices for unconditional
+                    if generated_projections_np and processed_volumes_01:
                         mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
                         log_dict = {}
 
-                        # Log individual projections
-                        for i, proj in enumerate(generated_projections_np):
-                            log_dict[f"generated_proj_{i}_{mode_label.lower()}"] = wandb.Image(
-                                proj, caption=f"Epoch {epoch + 1}: {mode_label} Generated Projection {i}"
-                            )
+                        if is_inpainting_unet:
+                            # Log projections for inpainting mode
+                            for i, proj in enumerate(generated_projections_np):
+                                log_dict[f"generated_proj_{i}_{mode_label.lower()}"] = wandb.Image(
+                                    proj, caption=f"Epoch {epoch + 1}: {mode_label} Generated Projection {i}"
+                                )
+                        else:
+                            # Log middle slices for unconditional mode
+                            for i, volume in enumerate(processed_volumes_01):
+                                middle_slice_idx = volume.shape[0] // 2  # D dimension middle
+                                middle_slice = volume[middle_slice_idx, :, :]  # (H, W)
+                                log_dict[f"generated_slice_{i}_{mode_label.lower()}"] = wandb.Image(
+                                    middle_slice, caption=f"Epoch {epoch + 1}: {mode_label} Generated Middle Slice {i}"
+                                )
 
-                        # For unconditional generation, also log a grid view
-                        if not is_inpainting_unet and len(generated_projections_np) > 1:
-                            # Create a grid of all projections
+                        # For unconditional generation, also log a grid view of middle slices
+                        if not is_inpainting_unet and len(processed_volumes_01) > 1:
+                            # Create a grid of all middle slices
                             import matplotlib.pyplot as plt
 
                             fig, axes = plt.subplots(
-                                1, len(generated_projections_np), figsize=(len(generated_projections_np) * 3, 3)
+                                1, len(processed_volumes_01), figsize=(len(processed_volumes_01) * 3, 3)
                             )
-                            if len(generated_projections_np) == 1:
+                            if len(processed_volumes_01) == 1:
                                 axes = [axes]
-                            fig.suptitle(f"Epoch {epoch + 1}: Unconditional Generation Grid")
+                            fig.suptitle(f"Epoch {epoch + 1}: Unconditional Generation Grid (Middle Slices)")
 
-                            for i, (ax, proj) in enumerate(zip(axes, generated_projections_np)):
-                                ax.imshow(proj, cmap="gray", vmin=0, vmax=1)
+                            for i, (ax, volume) in enumerate(zip(axes, processed_volumes_01)):
+                                middle_slice_idx = volume.shape[0] // 2
+                                middle_slice = volume[middle_slice_idx, :, :]
+                                ax.imshow(middle_slice, cmap="gray")
                                 ax.set_title(f"Sample {i + 1}")
                                 ax.axis("off")
 
@@ -1302,8 +1313,9 @@ class Trainer:
                             plt.close(fig)
 
                         wandb.log(log_dict, commit=False)
+                        view_type = "projections" if is_inpainting_unet else "middle slices"
                         print(
-                            f"Successfully logged {len(generated_projections_np)} {mode_label.lower()} projections to WandB"
+                            f"Successfully logged {len(processed_volumes_01)} {mode_label.lower()} {view_type} to WandB"
                         )
 
                     # Log inpainting comparison if available
@@ -1347,13 +1359,26 @@ class Trainer:
                     traceback.print_exc()
             elif self.args.logger == "tensorboard" and self.summary_writer:
                 try:
-                    # Log generated projections (needs channel dim: NCHW)
-                    if generated_projections_np:
+                    # Log generated images - projections for inpainting, middle slices for unconditional
+                    if is_inpainting_unet and generated_projections_np:
+                        # Log projections for inpainting mode
                         gen_proj_tensor = torch.from_numpy(np.array(generated_projections_np)).unsqueeze(
                             1
                         )  # Add C dim
                         self.summary_writer.add_images(
                             "generated_projections", gen_proj_tensor, epoch, dataformats="NCHW"
+                        )
+                    elif not is_inpainting_unet and processed_volumes_01:
+                        # Log middle slices for unconditional mode
+                        middle_slices = []
+                        for volume in processed_volumes_01:
+                            middle_slice_idx = volume.shape[0] // 2  # D dimension middle
+                            middle_slice = volume[middle_slice_idx, :, :]  # (H, W)
+                            middle_slices.append(middle_slice)
+
+                        gen_slice_tensor = torch.from_numpy(np.array(middle_slices)).unsqueeze(1)  # Add C dim
+                        self.summary_writer.add_images(
+                            "generated_middle_slices", gen_slice_tensor, epoch, dataformats="NCHW"
                         )
 
                     # Log masked inputs if available
@@ -1395,22 +1420,42 @@ class Trainer:
                         else:
                             print(f"Warning: Index {i} out of range for projections")
                 elif generated_projections_np:
-                    # Standard visualization - ensure this always runs for unconditional generation
-                    fig, axs = plt.subplots(1, num_samples, figsize=(num_samples * 3, 3))
-                    mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
-                    fig.suptitle(f"Epoch {epoch + 1} Generated Projections ({mode_label})")
+                    # Standard visualization - show middle slice for non-inpainting, projections for inpainting
+                    if is_inpainting_unet:
+                        # For inpainting mode, show projections
+                        fig, axs = plt.subplots(1, num_samples, figsize=(num_samples * 3, 3))
+                        fig.suptitle(f"Epoch {epoch + 1} Generated Projections (Inpainting)")
 
-                    if num_samples == 1:
-                        axs = np.array([axs])
+                        if num_samples == 1:
+                            axs = np.array([axs])
 
-                    for i in range(num_samples):
-                        if i < len(generated_projections_np):
-                            proj_np = generated_projections_np[i]
-                            axs[i].imshow(proj_np, cmap="gray", vmin=0, vmax=1)
-                            axs[i].set_title(f"Sample {i + 1}")
-                            axs[i].axis("off")
-                        else:
-                            print(f"Warning: Index {i} out of range for generated_projections_np")
+                        for i in range(num_samples):
+                            if i < len(generated_projections_np):
+                                proj_np = generated_projections_np[i]
+                                axs[i].imshow(proj_np, cmap="gray", vmin=0, vmax=1)
+                                axs[i].set_title(f"Sample {i + 1}")
+                                axs[i].axis("off")
+                            else:
+                                print(f"Warning: Index {i} out of range for generated_projections_np")
+                    else:
+                        # For non-inpainting mode, show middle slice instead of projections
+                        fig, axs = plt.subplots(1, num_samples, figsize=(num_samples * 3, 3))
+                        fig.suptitle(f"Epoch {epoch + 1} Generated Middle Slices (Unconditional)")
+
+                        if num_samples == 1:
+                            axs = np.array([axs])
+
+                        for i in range(num_samples):
+                            if i < len(processed_volumes_01):
+                                # Get middle slice from the 3D volume
+                                volume = processed_volumes_01[i]
+                                middle_slice_idx = volume.shape[0] // 2  # D dimension middle
+                                middle_slice = volume[middle_slice_idx, :, :]  # (H, W)
+                                axs[i].imshow(middle_slice, cmap="gray", vmin=0, vmax=1)
+                                axs[i].set_title(f"Sample {i + 1}")
+                                axs[i].axis("off")
+                            else:
+                                print(f"Warning: Index {i} out of range for processed_volumes_01")
                 else:
                     print("Warning: No generated projections available for visualization")
                     plt.close("all")  # Close any potentially open figures
@@ -1428,8 +1473,9 @@ class Trainer:
                     if not self.disable_telegram:
                         try:
                             mode_label = "Inpainting" if is_inpainting_unet else "Unconditional"
+                            view_type = "Projections" if is_inpainting_unet else "Middle Slices"
                             notifier.send_image(
-                                buf.getvalue(), caption=f"Epoch {epoch + 1} Generated Projections ({mode_label})"
+                                buf.getvalue(), caption=f"Epoch {epoch + 1} Generated {view_type} ({mode_label})"
                             )
                         except Exception as e:
                             self.accelerator.print(f"Failed to send Telegram image: {e}")
