@@ -75,6 +75,7 @@ def create_railway_track_1d(
     mask_type="gap_filling_compatible",
     batch_size=1,
     binary=False,
+    debug=False,
     **kwargs,
 ):
     """
@@ -99,7 +100,7 @@ def create_railway_track_1d(
         overlap,  # In gap mode, this becomes gap_size
         device,
         args=args,
-        output_dir=Path(output_dir) / "stitched_debug",
+        output_dir=Path(output_dir) / "stitched_debug" if debug else None,
         generation_batch_size=batch_size,
         strength=1.0,
         inpaint_region_size_ratio=kwargs.get("inpaint_region_size_ratio", 0.3),
@@ -462,6 +463,7 @@ def create_railway_track_3d(
     mask_type="gap_filling_compatible",
     batch_size=1,
     binary=False,
+    debug=False,
     **kwargs,
 ):
     """
@@ -492,7 +494,7 @@ def create_railway_track_3d(
                 scheduler=scheduler,
                 inpainting_pipeline=inpainting_pipeline,
                 device=device,
-                output_dir=output_dir / f"strip_{j}_{k}",
+                output_dir=output_dir / f"strip_{j}_{k}" if debug else output_dir,
                 n_blocks_length=grids_length,
                 overlap=overlap_d,
                 inference_steps=inference_steps,
@@ -501,6 +503,7 @@ def create_railway_track_3d(
                 mask_type=mask_type,
                 batch_size=batch_size,
                 binary=binary,
+                debug=debug,
                 **kwargs,
             )
 
@@ -593,6 +596,7 @@ def create_railway_track(
     overlap_w=8,
     overlap_l=8,
     scheduler_type="ddim",
+    debug=False,
     **kwargs,
 ):
     """
@@ -639,6 +643,7 @@ def create_railway_track(
             output_dir=output_dir,
             n_blocks_length=grids_depth,
             overlap=overlap_d,
+            debug=debug,
             **kwargs,
         )
     else:
@@ -656,6 +661,7 @@ def create_railway_track(
             overlap_d=overlap_d,
             overlap_h=overlap_w,
             overlap_w=overlap_l,
+            debug=debug,
             **kwargs,
         )
 
@@ -754,6 +760,7 @@ def main():
     parser.add_argument(
         "--output_name", type=str, default=None, help="Custom name for output file (default: auto-generated)"
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug output (saves intermediate strips)")
 
     args = parser.parse_args()
 
@@ -783,6 +790,7 @@ def main():
         overlap_w=args.overlap_w,
         overlap_l=args.overlap_l,
         scheduler_type=args.scheduler_type,
+        debug=args.debug,
         inference_steps=args.inference_steps,
         seed=args.seed,
         stitching_mode=args.stitching_mode,
