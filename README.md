@@ -70,14 +70,12 @@ accelerate launch --num_processes=$NUM_GPU --mixed_precision='fp16' --num_machin
 --patience 1000 \
 --timesteps 1000 \
 --wandb_mode "offline" \
---project_name "3D_base" \
+--project_name "3D_inpainting_diffusion" \
 --inpainting_mode 0 \
---mask_type "central_large_block" \
+--mask_type "gap_filling_compatible" \
 --repaint_guidance \
 --use_weighted_loss \
 --sampler_type "ddpm" \
---central_block_max_ratio 0.7 \
---central_block_min_ratio 0.3 \
 --check_for_edges
 ```
 
@@ -101,14 +99,12 @@ accelerate launch --num_processes=$NUM_GPU --mixed_precision='fp16' --num_machin
 --patience 1000 \
 --timesteps 1000 \
 --wandb_mode "offline" \
---project_name "3D_inpainting" \
+--project_name "3D_inpainting_diffusion" \
 --inpainting_mode 1 \
---mask_type "central_large_block" \
+--mask_type "gap_filling_compatible" \
 --repaint_guidance \
 --use_weighted_loss \
 --sampler_type "ddpm" \
---central_block_max_ratio 0.7 \
---central_block_min_ratio 0.3 \
 --check_for_edges
 ```
 
@@ -130,6 +126,73 @@ python eval.py --model_path "$BASE" \
 --n_blocks 100 \
 --inpaint_region_size_ratio 0.3 \
 --inference_steps 25
+```
+
+### Enhanced Evaluation Pipeline
+
+For comprehensive evaluation with advanced parameters:
+
+```bash
+python eval.py --model_path "/path/to/base/model" \
+--inpainting_model_path "/path/to/inpainting/model" \
+--output_dir "/path/to/output/" \
+--n_blocks 100 \
+--inference_steps 60 \
+--scheduler_type "ddim" \
+--seed 123 \
+--stitching_mode "separate_inpainting" \
+--mask_type "gap_filling_compatible" \
+--overlap 8 \
+--batch_size 8 \
+--binary
+```
+
+### Polyhedron Segmentation
+
+For fast polyhedron segmentation of generated granular media:
+
+```bash
+python polyhedron_segmentation.py --input /path/to/generated/file.vti \
+--output "/path/to/output/segmentation.json" \
+--no-paraview-multiblock \
+--decimation-ratio 0.95 \
+--smoothing-iterations 15 \
+--erosion-iterations 0 \
+--min-polyhedron-size 1 \
+--remove-boundary-polyhedrons \
+--max-voxel-aspect-ratio 0.0 \
+--fast-mesh-extraction \
+--stream-batch-size 2000 \
+--num-workers 20 \
+--batch-mesh-size 500 \
+--force-cpu \
+--num-export-workers 20 \
+--export-batch-size 400 \
+--fast-paraview-export \
+--ultra-fast-mode \
+--max-chunk-workers 20
+```
+
+For enabling chunking, add:
+```bash
+--use-chunking \
+--fast-chunk-merge
+```
+
+### Railway Track Generation
+
+For specialized railway track granular media generation:
+
+```bash
+python railway_track.py --model_path "/path/to/base/model" \
+--inpainting_model_path "/path/to/inpainting/model" \
+--output_dir "/path/to/output/" \
+--target_length 1.5 \
+--target_depth 0.3 \
+--target_width 1.2 \
+--inference_steps 40 \
+--scheduler_type "ddim" \
+--batch_size 16
 ```
 
 ## Additional Tools
