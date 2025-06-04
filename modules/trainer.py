@@ -18,9 +18,76 @@ from utils.telegram_notifier import notifier
 from pathlib import Path
 from scipy import ndimage
 import pyvista as pv
+import copy
 
 
 PYVISTA_AVAILABLE = True  # hardcoded availability
+
+
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+    Maintains a moving average of model weights during training.
+    """
+
+    def __init__(self, model, decay=0.9999, update_after_step=0, update_every=1):
+        """
+        Args:
+            model: The model to track with EMA
+            decay: EMA decay rate (0.9999 is common for diffusion models)
+            update_after_step: Start EMA updates after this many steps
+            update_every: Update EMA every N steps
+        """
+        self.decay = decay
+        self.update_after_step = update_after_step
+        self.update_every = update_every
+        self.step = 0
+
+        # Create EMA model as a copy of the original model
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+
+        # Disable gradients for EMA model
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+
+        # Ensure EMA model has the same dtype as the original model
+        if hasattr(model, "dtype"):
+            self.ema_model = self.ema_model.to(dtype=model.dtype)
+
+    def update(self, model):
+        """Update EMA weights"""
+        self.step += 1
+
+        if self.step <= self.update_after_step:
+            return
+
+        if self.step % self.update_every != 0:
+            return
+
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
+                ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1 - self.decay)
+
+    def apply_shadow(self, model):
+        """Apply EMA weights to the model (temporarily)"""
+        with torch.no_grad():
+            for model_param, ema_param in zip(model.parameters(), self.ema_model.parameters()):
+                model_param.data.copy_(ema_param.data)
+
+    def restore(self, model, backup_params):
+        """Restore original model weights from backup"""
+        with torch.no_grad():
+            for model_param, backup_param in zip(model.parameters(), backup_params):
+                model_param.data.copy_(backup_param)
+
+    def state_dict(self):
+        """Get EMA model state dict"""
+        return self.ema_model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """Load EMA model state dict"""
+        self.ema_model.load_state_dict(state_dict)
 
 
 class Trainer:
@@ -33,6 +100,20 @@ class Trainer:
         self.use_2d_unet = use_2d_unet
         self.disable_telegram = disable_telegram
         self.device = args.device
+
+        # Initialize EMA if enabled
+        self.use_ema = getattr(args, "use_ema", False)
+        self.ema = None
+        if self.use_ema:
+            ema_decay = getattr(args, "ema_decay", 0.9999)
+            ema_update_after_step = getattr(args, "ema_update_after_step", 0)
+            ema_update_every = getattr(args, "ema_update_every", 1)
+            self.ema = EMA(
+                model=model, decay=ema_decay, update_after_step=ema_update_after_step, update_every=ema_update_every
+            )
+            print(
+                f"EMA initialized with decay={ema_decay}, update_after_step={ema_update_after_step}, update_every={ema_update_every}"
+            )
 
         # cache some samples from the dataset for generation context later
         self.cached_context_samples = None
@@ -70,6 +151,17 @@ class Trainer:
                 self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler
             )
             self.device = self.accelerator.device
+
+            # Move EMA model to the same device as the main model after accelerator preparation
+            if self.use_ema and self.ema is not None:
+                self.ema.ema_model = self.ema.ema_model.to(self.device)
+                # Ensure EMA model is in eval mode and has consistent dtype
+                self.ema.ema_model.eval()
+                # Match the dtype of the main model
+                if hasattr(self.model, "dtype"):
+                    self.ema.ema_model = self.ema.ema_model.to(dtype=self.model.dtype)
+                print(f"EMA model moved to device: {self.device}")
+
             if self.accelerator.is_main_process:
                 print(f"Using Accelerator on device: {self.device}")
                 print(f"Number of processes: {self.accelerator.num_processes}")
@@ -107,6 +199,17 @@ class Trainer:
                     print("Logging disabled.")
         else:
             self.model.to(self.device)
+
+            # Move EMA model to the same device as the main model when not using accelerator
+            if self.use_ema and self.ema is not None:
+                self.ema.ema_model = self.ema.ema_model.to(self.device)
+                # Ensure EMA model is in eval mode and has consistent dtype
+                self.ema.ema_model.eval()
+                # Match the dtype of the main model
+                if hasattr(self.model, "dtype"):
+                    self.ema.ema_model = self.ema.ema_model.to(dtype=self.model.dtype)
+                print(f"EMA model moved to device: {self.device}")
+
             # not using accelerator, using device: self.device which defaults to "cuda"
             print(f"Not using Accelerator. Using device: {self.device}")
             if self.args.logger == "wandb":
@@ -185,6 +288,11 @@ class Trainer:
                     "val_loss": val_loss,
                     "learning_rate": self.optimizer.param_groups[0]["lr"],
                 }
+
+                # Add EMA step to logging if available
+                if self.use_ema and self.ema is not None:
+                    log_data["ema_step"] = self.ema.step
+
                 if self.args.logger == "wandb":
                     try:
                         wandb.log({**log_data, "epoch": epoch})
@@ -389,9 +497,34 @@ class Trainer:
 
         self.optimizer.step()
 
+        # Update EMA after optimizer step
+        if self.use_ema and self.ema is not None:
+            # Get the unwrapped model for EMA update
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            # Ensure EMA update happens with the correct model state
+            self.ema.update(unwrapped_model)
+            # Ensure EMA model stays on the correct device and dtype
+            self.ema.ema_model = self.ema.ema_model.to(
+                device=self.device, dtype=unwrapped_model.dtype if hasattr(unwrapped_model, "dtype") else None
+            )
+
         return loss.detach()
 
     def validate(self, epoch):
+        # Optionally use EMA model for validation
+        use_ema_for_validation = (
+            getattr(self.args, "use_ema_for_validation", True) and self.use_ema and self.ema is not None
+        )
+
+        if use_ema_for_validation:
+            # Backup current model weights
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            backup_params = [param.data.clone() for param in unwrapped_model.parameters()]
+            # Apply EMA weights
+            self.ema.apply_shadow(unwrapped_model)
+            if self.accelerator.is_main_process and epoch == 0:
+                print("Using EMA model for validation")
+
         self.model.eval()
         total_loss = 0
         with torch.no_grad():
@@ -412,6 +545,10 @@ class Trainer:
 
         num_samples_in_loader = len(self.val_loader.dataset)
         avg_val_loss = total_loss / num_samples_in_loader
+
+        # Restore original model weights if we used EMA
+        if use_ema_for_validation:
+            self.ema.restore(unwrapped_model, backup_params)
 
         return avg_val_loss
 
@@ -578,13 +715,42 @@ class Trainer:
         if checkpoint and epoch is not None:
             chkpt_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch + 1}")
             self.accelerator.save_state(chkpt_path)
+
+            # Save EMA state if available
+            if self.use_ema and self.ema is not None:
+                ema_path = os.path.join(chkpt_path, "ema_model.pt")
+                torch.save(self.ema.state_dict(), ema_path)
+                self.accelerator.print(f"EMA model saved to {ema_path}")
+
             self.accelerator.print(f"Checkpoint saved to {chkpt_path}")
         else:
-            # For the sake of compatibility with the diffusers pipeline, we store the model directly as the DDPMPipeline
+            # Decide whether to save regular model or EMA model
+            save_ema_as_final = getattr(self.args, "save_ema_as_final", True) and self.use_ema and self.ema is not None
+
             unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+            if save_ema_as_final:
+                # Backup current weights and apply EMA weights for saving
+                backup_params = [param.data.clone() for param in unwrapped_model.parameters()]
+                self.ema.apply_shadow(unwrapped_model)
+                self.accelerator.print("Saving EMA model as final model")
+
+            # For the sake of compatibility with the diffusers pipeline, we store the model directly as the DDPMPipeline
             pipeline = DDPMPipeline(unet=unwrapped_model, scheduler=self.noise_scheduler)
             pipeline.save_pretrained(self.args.output_dir)
             self.accelerator.print(f"Model saved to {self.args.output_dir}")
+
+            # Restore original weights if we used EMA
+            if save_ema_as_final:
+                self.ema.restore(unwrapped_model, backup_params)
+
+            # Save separate EMA model
+            if self.use_ema and self.ema is not None:
+                ema_save_dir = os.path.join(self.args.output_dir, "ema_model")
+                os.makedirs(ema_save_dir, exist_ok=True)
+                ema_pipeline = DDPMPipeline(unet=self.ema.ema_model, scheduler=self.noise_scheduler)
+                ema_pipeline.save_pretrained(ema_save_dir)
+                self.accelerator.print(f"EMA model saved separately to {ema_save_dir}")
 
             args_dict = vars(self.args).copy()
             for key, value in args_dict.items():
@@ -691,7 +857,28 @@ class Trainer:
         masked_vti_processed = None
 
         try:
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            # Optionally use EMA model for generation
+            use_ema_for_generation = (
+                getattr(self.args, "use_ema_for_generation", True) and self.use_ema and self.ema is not None
+            )
+
+            if use_ema_for_generation:
+                # Ensure EMA model is properly synchronized and on correct device
+                self.ema.ema_model.eval()
+                self.ema.ema_model = self.ema.ema_model.to(self.device)
+
+                # Ensure EMA model has the same dtype as the main model
+                main_model = self.accelerator.unwrap_model(self.model)
+                if hasattr(main_model, "dtype"):
+                    self.ema.ema_model = self.ema.ema_model.to(dtype=main_model.dtype)
+
+                unwrapped_model = self.ema.ema_model
+                if epoch == 0:
+                    print("Using EMA model for sample generation")
+                    print(f"EMA model device: {next(self.ema.ema_model.parameters()).device}")
+                    print(f"EMA model dtype: {next(self.ema.ema_model.parameters()).dtype}")
+            else:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
             num_samples = 4
             num_inference_steps = self.args.timesteps
 

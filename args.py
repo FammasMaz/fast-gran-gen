@@ -91,6 +91,27 @@ def get_args():
         "--use_2d_unet", action="store_true", help="Use a 2D UNet treating depth as channels instead of a 3D UNet."
     )  # not recommended. 2D UNet is not as good as 3D UNet.
 
+    ##### EMA (Exponential Moving Average) Configuration #####
+    parser.add_argument(
+        "--use_ema", type=str2bool, default=False, help="Use Exponential Moving Average for model weights."
+    )
+    parser.add_argument(
+        "--ema_decay", type=float, default=0.9999, help="EMA decay rate (higher values give more smoothing)."
+    )
+    parser.add_argument(
+        "--ema_update_after_step", type=int, default=100, help="Start EMA updates after this many training steps."
+    )
+    parser.add_argument("--ema_update_every", type=int, default=1, help="Update EMA every N training steps.")
+    parser.add_argument(
+        "--use_ema_for_validation", type=str2bool, default=True, help="Use EMA weights for validation."
+    )
+    parser.add_argument(
+        "--use_ema_for_generation", type=str2bool, default=True, help="Use EMA weights for sample generation."
+    )
+    parser.add_argument(
+        "--save_ema_as_final", type=str2bool, default=True, help="Save EMA weights as the final model."
+    )
+
     ##### Inpainting Mode and Mask Configuration #####
 
     parser.add_argument(
