@@ -2166,8 +2166,7 @@ class PolyhedronSegmentation:
                 mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
 
             # Decimation
-            if 0 < decimation_ratio < 1:
-                mesh = mesh.decimate(decimation_ratio)
+            mesh = self._apply_aggressive_decimation(mesh, decimation_ratio, target_vertices=30, target_faces=40)
 
             if mesh.n_points == 0 or mesh.n_cells == 0:
                 return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
@@ -2194,6 +2193,64 @@ class PolyhedronSegmentation:
         except Exception as e:
             print(f"Error extracting polyhedron {label_id}: {e}")
             return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+    def _apply_aggressive_decimation(
+        self, mesh, decimation_ratio: float, target_vertices: int = 30, target_faces: int = 40, label_id: int = None
+    ) -> "pv.PolyData":
+        """
+        Apply aggressive decimation to achieve target vertex/face counts similar to original low-poly data.
+
+        Args:
+            mesh: PyVista mesh to decimate
+            decimation_ratio: Original decimation ratio (0-1)
+            target_vertices: Target maximum vertices (default: 30)
+            target_faces: Target maximum faces (default: 40)
+            label_id: Polyhedron ID for logging
+
+        Returns:
+            Decimated mesh
+        """
+        if not (0 < decimation_ratio < 1):
+            return mesh
+
+        original_vertices = mesh.n_points
+        original_faces = mesh.n_cells
+
+        if label_id is not None:
+            print(f"    Decimating polyhedron {label_id}: {original_vertices} vertices, {original_faces} faces")
+
+        # Multi-stage aggressive decimation to avoid mesh collapse
+        if original_vertices > target_vertices:
+            # Stage 1: If very high vertex count, reduce to ~100 first
+            if original_vertices > 100:
+                stage1_reduction = min(0.8, 1.0 - (100 / original_vertices))
+                mesh = mesh.decimate(stage1_reduction)
+                if label_id is not None:
+                    print(f"      Stage 1: {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+            # Stage 2: Target-based aggressive decimation
+            if mesh.n_points > target_vertices:
+                target_reduction = min(0.9, 1.0 - (target_vertices / mesh.n_points))
+                mesh = mesh.decimate(target_reduction)
+                if label_id is not None:
+                    print(f"      Stage 2: {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+            # Stage 3: Vertex clustering cleanup if still too many vertices
+            if mesh.n_points > target_vertices * 1.2:  # 20% tolerance
+                bbox_size = np.ptp(mesh.points, axis=0) if mesh.n_points > 0 else np.array([1, 1, 1])
+                adaptive_tolerance = np.mean(bbox_size) / 30  # Aggressive clustering
+                mesh = mesh.clean(tolerance=adaptive_tolerance)
+                if label_id is not None:
+                    print(f"      Stage 3 (clustering): {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+            if label_id is not None:
+                reduction_percent = 100 * (1 - mesh.n_points / original_vertices) if original_vertices > 0 else 0
+                print(
+                    f"    Final decimation: {original_vertices}→{mesh.n_points} vertices "
+                    f"({reduction_percent:.1f}% reduction)"
+                )
+
+        return mesh
 
     def _extract_faces_optimized(self, raw_faces: np.ndarray) -> List[List[int]]:
         """
@@ -2297,8 +2354,9 @@ class PolyhedronSegmentation:
                 mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
 
             # Decimation
-            if 0 < decimation_ratio < 1:
-                mesh = mesh.decimate(decimation_ratio)
+            mesh = self._apply_aggressive_decimation(
+                mesh, decimation_ratio, target_vertices=30, target_faces=40, label_id=label_id
+            )
 
             if mesh.n_points == 0 or mesh.n_cells == 0:
                 return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
@@ -2417,10 +2475,41 @@ class PolyhedronSegmentation:
                         "skipped_reason": "failed_post_smoothing_validation",
                     }
 
-        # Apply decimation to reduce polygon count
+        # Apply AGGRESSIVE decimation to reduce polygon count (targeting ~30 vertices, ~40 faces)
         if 0 < decimation_ratio < 1:
-            target_reduction = decimation_ratio
-            mesh = mesh.decimate(target_reduction)
+            target_vertices = 30  # Target max vertices to match original low-poly data
+            target_faces = 40  # Target max faces to match original low-poly data
+            original_vertices = mesh.n_points
+            original_faces = mesh.n_cells
+
+            print(f"    Decimating polyhedron {label_id}: {original_vertices} vertices, {original_faces} faces")
+
+            # Multi-stage aggressive decimation to avoid mesh collapse
+            if original_vertices > target_vertices:
+                # Stage 1: If very high vertex count, reduce to ~100 first
+                if original_vertices > 100:
+                    stage1_reduction = min(0.8, 1.0 - (100 / original_vertices))
+                    mesh = mesh.decimate(stage1_reduction)
+                    print(f"      Stage 1: {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+                # Stage 2: Target-based aggressive decimation
+                if mesh.n_points > target_vertices:
+                    target_reduction = min(0.9, 1.0 - (target_vertices / mesh.n_points))
+                    mesh = mesh.decimate(target_reduction)
+                    print(f"      Stage 2: {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+                # Stage 3: Vertex clustering cleanup if still too many vertices
+                if mesh.n_points > target_vertices * 1.2:  # 20% tolerance
+                    bbox_size = np.ptp(mesh.points, axis=0) if mesh.n_points > 0 else np.array([1, 1, 1])
+                    adaptive_tolerance = np.mean(bbox_size) / 30  # Aggressive clustering
+                    mesh = mesh.clean(tolerance=adaptive_tolerance)
+                    print(f"      Stage 3 (clustering): {mesh.n_points} vertices, {mesh.n_cells} faces")
+
+                reduction_percent = 100 * (1 - mesh.n_points / original_vertices) if original_vertices > 0 else 0
+                print(
+                    f"    Final decimation: {original_vertices}→{mesh.n_points} vertices "
+                    f"({reduction_percent:.1f}% reduction)"
+                )
 
             # Re-check coordinates after decimation
             if coordinate_sanity_check:
