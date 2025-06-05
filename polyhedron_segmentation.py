@@ -558,6 +558,7 @@ class PolyhedronSegmentation:
         self.voxel_spacing = np.array(voxel_spacing)
         self.origin = np.array(origin)
         self.min_size_for_gpu = min_size_for_gpu
+        self.fix_for_lmgc90 = False
 
         # Initialize GPU backend
         self.gpu_enabled = _gpu_backend.set_backend(gpu_backend, gpu_memory_fraction)
@@ -2185,6 +2186,10 @@ class PolyhedronSegmentation:
             if mesh.n_points == 0 or mesh.n_cells == 0:
                 return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
 
+            # Fix mesh for lmgc90 if requested
+            if self.fix_for_lmgc90:
+                mesh = self._fix_mesh_for_lmgc90(mesh, label_id)
+
             # OPTIMIZED: Extract faces more efficiently
             vertices = mesh.points
             faces_list = self._extract_faces_optimized(mesh.faces)
@@ -2540,6 +2545,10 @@ class PolyhedronSegmentation:
 
         if mesh.n_points == 0 or mesh.n_cells == 0:  # Check again after processing
             return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0}
+
+        # Fix mesh for lmgc90 if requested
+        if self.fix_for_lmgc90:
+            mesh = self._fix_mesh_for_lmgc90(mesh, label_id)
 
         # Final coordinate validation before returning
         if coordinate_sanity_check:
@@ -3927,6 +3936,38 @@ class PolyhedronSegmentation:
 
         return all_results
 
+    def _fix_mesh_for_lmgc90(self, mesh: "pv.PolyData", label_id: int) -> "pv.PolyData":
+        """
+        Checks and repairs a mesh to ensure it is watertight for simulation software like lmgc90.
+        """
+        if mesh.n_points == 0 or mesh.n_cells == 0:
+            return mesh
+
+        initial_open_edges = mesh.n_open_edges
+        if initial_open_edges > 0:
+            # Fill holes to make the mesh watertight
+            # Use a large hole size to fill all holes. The default might be too small.
+            mesh = mesh.fill_holes(hole_size=1e9)
+
+            # Clean the mesh to remove duplicate vertices and degenerate faces
+            mesh = mesh.clean()
+
+            if mesh.n_open_edges != 0:
+                print(
+                    f"    WARNING: Polyhedron {label_id}: Failed to fill all holes. Open edges changed from {initial_open_edges} to {mesh.n_open_edges}."
+                )
+
+        # Triangulate the mesh to ensure all faces are triangles, which is more robust for simulations.
+        mesh = mesh.triangulate()
+
+        # A final clean can help remove any degeneracies introduced by triangulation.
+        mesh = mesh.clean()
+
+        if not mesh.is_manifold:
+            print(f"    WARNING: Polyhedron {label_id}: Mesh is not manifold even after fixing.")
+
+        return mesh
+
 
 def main():
     """Main function for command-line usage."""
@@ -4217,6 +4258,12 @@ def main():
         help="Force CPU-only processing, disabling all GPU acceleration.",
     )
 
+    parser.add_argument(
+        "--fix-mesh-for-lmgc90",
+        action="store_true",
+        help="Apply a mesh fixing routine to ensure meshes are watertight for lmgc90.",
+    )
+
     args = parser.parse_args()
 
     # Initialize segmentation with GPU options
@@ -4228,6 +4275,7 @@ def main():
         gpu_memory_fraction=args.gpu_memory_fraction,
         min_size_for_gpu=args.min_size_for_gpu,
     )
+    segmentation.fix_for_lmgc90 = args.fix_mesh_for_lmgc90
 
     # Load voxel grid
     print(f"Loading input grid: {args.input}")
