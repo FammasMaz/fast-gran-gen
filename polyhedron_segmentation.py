@@ -514,6 +514,7 @@ def _global_mesh_task(
     use_sdf,
     coordinate_sanity_check=True,
     coordinate_validation_threshold=1e4,
+    target_vertices=30,
 ):
     polyhedron_size = np.sum(labeled_grid == label_id)
     mesh_data = segmentation_instance.extract_polyhedron_mesh(
@@ -524,6 +525,7 @@ def _global_mesh_task(
         use_sdf,
         coordinate_sanity_check,
         coordinate_validation_threshold,
+        target_vertices,
     )
     return label_id, polyhedron_size, mesh_data
 
@@ -1698,6 +1700,7 @@ class PolyhedronSegmentation:
                 "reduce_smoothing_for_small": reduce_smoothing_for_small,
                 "num_workers": num_workers,
                 "fast_mesh_extraction": fast_mesh_extraction,
+                "target_vertices": kwargs.get("target_vertices", 30),
             }
 
             candidate_polyhedron_mesh_data_list = self._stream_process_large_label_set(
@@ -1765,6 +1768,7 @@ class PolyhedronSegmentation:
                         use_sdf,
                         True,  # coordinate_sanity_check
                         coordinate_validation_threshold,
+                        kwargs.get("target_vertices", 30),
                     )
                     if mesh_data_item and len(mesh_data_item.get("vertices", [])) > 0:
                         candidate_polyhedron_mesh_data_list.append(
@@ -1909,6 +1913,7 @@ class PolyhedronSegmentation:
         small_threshold: int = 500,
         reduce_smoothing_for_small: bool = True,
         num_workers: int = 1,
+        target_vertices: int = 30,
     ) -> List[Dict]:
         """
         Fast batch mesh extraction with multiple optimizations.
@@ -1947,6 +1952,7 @@ class PolyhedronSegmentation:
             batch_size=batch_size,
             num_workers=num_workers,
             fast_mode=fast_mode_optimized,
+            target_vertices=target_vertices,
         )
 
         print(f"Fast mesh extraction completed. Processed {len(results)} polyhedrons successfully.")
@@ -1963,6 +1969,7 @@ class PolyhedronSegmentation:
         batch_size: int,
         num_workers: int,
         fast_mode: bool = False,
+        target_vertices: int = 30,
     ) -> List[Dict]:
         """
         OPTIMIZED: Vectorized batch processing to eliminate individual grid scans.
@@ -1986,6 +1993,7 @@ class PolyhedronSegmentation:
             coordinate_validation_threshold,
             fast_mode,
             num_workers,
+            target_vertices,
         )
 
         print(f"Vectorized extraction completed in {time.time() - start_time:.2f}s")
@@ -2001,6 +2009,7 @@ class PolyhedronSegmentation:
         coordinate_validation_threshold: float,
         fast_mode: bool = False,
         num_workers: int = 1,
+        target_vertices: int = 30,
     ) -> List[Dict]:
         """
         Vectorized polyhedron extraction that processes multiple polyhedrons simultaneously.
@@ -2060,6 +2069,7 @@ class PolyhedronSegmentation:
                             use_sdf,
                             coordinate_validation_threshold,
                             fast_mode,
+                            target_vertices,
                         )
                         if result and len(result.get("vertices", [])) > 0:
                             all_results.append(result)
@@ -2078,6 +2088,7 @@ class PolyhedronSegmentation:
                         use_sdf,
                         coordinate_validation_threshold,
                         fast_mode,
+                        target_vertices,
                     )
                     if result and len(result.get("vertices", [])) > 0:
                         all_results.append(result)
@@ -2095,6 +2106,7 @@ class PolyhedronSegmentation:
         use_sdf: bool,
         coordinate_validation_threshold: float,
         fast_mode: bool = False,
+        target_vertices: int = 30,
     ) -> Dict:
         """
         Extract mesh for a single polyhedron using pre-computed coordinates.
@@ -2166,7 +2178,9 @@ class PolyhedronSegmentation:
                 mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
 
             # Decimation
-            mesh = self._apply_aggressive_decimation(mesh, decimation_ratio, target_vertices=30, target_faces=40)
+            mesh = self._apply_aggressive_decimation(
+                mesh, decimation_ratio, target_vertices=target_vertices, target_faces=40
+            )
 
             if mesh.n_points == 0 or mesh.n_cells == 0:
                 return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
@@ -2274,6 +2288,7 @@ class PolyhedronSegmentation:
         use_sdf: bool,
         coordinate_validation_threshold: float,
         fast_mode: bool = False,
+        target_vertices: int = 30,
     ) -> Dict:
         """
         Optimized single polyhedron extraction with reduced overhead.
@@ -2355,7 +2370,7 @@ class PolyhedronSegmentation:
 
             # Decimation
             mesh = self._apply_aggressive_decimation(
-                mesh, decimation_ratio, target_vertices=30, target_faces=40, label_id=label_id
+                mesh, decimation_ratio, target_vertices=target_vertices, target_faces=40, label_id=label_id
             )
 
             if mesh.n_points == 0 or mesh.n_cells == 0:
@@ -2401,6 +2416,7 @@ class PolyhedronSegmentation:
         use_sdf: bool = True,
         coordinate_sanity_check: bool = True,
         max_reasonable_coord: float = 1e4,  # Keep this as the parameter name for consistency
+        target_vertices: int = 30,  # Target maximum vertices for aggressive decimation
     ) -> Dict:
         """
         Extract mesh (vertices and faces) for a specific labeled polyhedron using SDF.
@@ -2477,7 +2493,6 @@ class PolyhedronSegmentation:
 
         # Apply AGGRESSIVE decimation to reduce polygon count (targeting ~30 vertices, ~40 faces)
         if 0 < decimation_ratio < 1:
-            target_vertices = 30  # Target max vertices to match original low-poly data
             target_faces = 40  # Target max faces to match original low-poly data
             original_vertices = mesh.n_points
             original_faces = mesh.n_cells
@@ -2602,6 +2617,8 @@ class PolyhedronSegmentation:
         skip_sdf_for_small: bool = True,
         small_polyhedron_threshold: int = 500,
         reduce_smoothing_for_small: bool = True,
+        # Decimation control
+        target_vertices: int = 30,  # Target maximum vertices for aggressive decimation
         **other_kwargs,  # Catch any other unexpected kwargs
     ) -> Dict:
         """
@@ -2631,6 +2648,7 @@ class PolyhedronSegmentation:
             enable_mesh_range_outlier_filter: Whether to enable the mesh range outlier filter.
             mesh_range_outlier_iqr_factor: IQR factor for mesh range outlier detection.
             mesh_range_outlier_median_factor: Median factor for mesh range outlier detection.
+            target_vertices: Target maximum number of vertices for aggressive decimation
 
         Returns:
             Dictionary containing all extracted polyhedrons
@@ -2802,6 +2820,7 @@ class PolyhedronSegmentation:
                 small_polyhedron_threshold,
                 reduce_smoothing_for_small,
                 optimal_workers,
+                target_vertices,
             )
         elif num_workers > 1 and len(label_ids_to_process) > 1:
             # Optimize worker count for CPU-intensive mesh extraction
@@ -2819,6 +2838,7 @@ class PolyhedronSegmentation:
                         use_sdf,
                         True,  # coordinate_sanity_check
                         coordinate_validation_threshold,
+                        target_vertices,
                     )
                     for label_id in label_ids_to_process
                 ]
@@ -2853,6 +2873,7 @@ class PolyhedronSegmentation:
                     use_sdf,
                     True,  # coordinate_sanity_check
                     coordinate_validation_threshold,  # use the renamed parameter here
+                    target_vertices,
                 )
                 if mesh_data_item and len(mesh_data_item.get("vertices", [])) > 0:
                     candidate_polyhedron_mesh_data_list.append({"polyhedron_size": polyhedron_size, **mesh_data_item})
@@ -4109,6 +4130,14 @@ def main():
         help="Reduce smoothing iterations for small polyhedrons in fast mode (default: True).",
     )
 
+    # Decimation control
+    parser.add_argument(
+        "--target-vertices",
+        type=int,
+        default=30,
+        help="Target maximum number of vertices for aggressive decimation (default: 30).",
+    )
+
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -4255,6 +4284,8 @@ def main():
             skip_sdf_for_small=args.skip_sdf_for_small,
             small_polyhedron_threshold=args.small_polyhedron_threshold,
             reduce_smoothing_for_small=args.reduce_smoothing_for_small,
+            # Decimation control
+            target_vertices=args.target_vertices,  # Target maximum vertices for aggressive decimation
         )
     else:
         polyhedrons_data = segmentation.process_voxel_grid(
@@ -4290,6 +4321,8 @@ def main():
             skip_sdf_for_small=args.skip_sdf_for_small,
             small_polyhedron_threshold=args.small_polyhedron_threshold,
             reduce_smoothing_for_small=args.reduce_smoothing_for_small,
+            # Decimation control
+            target_vertices=args.target_vertices,  # Target maximum vertices for aggressive decimation
         )
 
     processing_time = time.time() - start_time
