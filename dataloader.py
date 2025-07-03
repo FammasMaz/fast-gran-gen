@@ -77,6 +77,7 @@ class VoxelDataset(Dataset):
         interpol=False,
         sdf_scale=5.0,
         load_conditioning=True,  # whether to load conditioning statistics
+        cache_workers=35,
     ):
         """
         Initialize the VoxelDataset.
@@ -94,6 +95,7 @@ class VoxelDataset(Dataset):
         self.interpol = interpol
         self.target_size = (64, 64, 64) if interpol else voxel_size
         self.load_conditioning = load_conditioning
+        self.cache_workers = cache_workers
 
         # Initialize variables
         self.axis_stats = None
@@ -249,9 +251,7 @@ class VoxelDataset(Dataset):
     def _create_index_mapping(self):
         print(f"[Worker {os.getpid()}] Creating index mapping with filtering...")
 
-        num_cores = int(
-            mp.cpu_count() // 1.25
-        )  # use only 80% of the cores for now...found out that perf is slightly better with this
+        num_cores = self.cache_workers
         print(f"[Worker {os.getpid()}] Using {num_cores} cores for filtering")
 
         with mp.Pool(
@@ -353,6 +353,7 @@ def get_voxel_dataloaders(
     interpol=False,
     sdf_scale=5.0,
     load_conditioning=True,
+    cache_workers=35,
 ):
     dataset = VoxelDataset(
         h5_file_path=h5_file_path,
@@ -370,6 +371,7 @@ def get_voxel_dataloaders(
         interpol=interpol,
         sdf_scale=sdf_scale,
         load_conditioning=load_conditioning,
+        cache_workers=cache_workers,
     )
 
     val_size = int(len(dataset) * val_split)

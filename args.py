@@ -32,6 +32,9 @@ def get_args():
         default="dataset/.cache",
         help="Directory to store dataset cache files",
     )  # this is the directory to store the dataset cache files
+    parser.add_argument(
+        "--cache_workers", type=int, default=35, help="Number of workers to use for caching."
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--img_size", type=tuple, default=(512, 512)

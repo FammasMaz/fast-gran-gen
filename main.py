@@ -63,6 +63,7 @@ def main():
         sdf=args.use_sdf,
         interpol=False,  # interpolation is not used
         sdf_scale=args.sdf_scale,
+        cache_workers=args.cache_workers,
     )
 
     sample_batch = next(iter(train_loader))
