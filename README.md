@@ -152,25 +152,27 @@ python eval.py --model_path "/path/to/base/model" \
 For fast polyhedron segmentation of generated granular media:
 
 ```bash
-python polyhedron_segmentation.py --input /path/to/generated/file.vti \
---output "/path/to/output/segmentation.json" \
---no-paraview-multiblock \
---decimation-ratio 0.95 \
---smoothing-iterations 15 \
---erosion-iterations 0 \
---min-polyhedron-size 1 \
---remove-boundary-polyhedrons \
---max-voxel-aspect-ratio 0.0 \
---fast-mesh-extraction \
---stream-batch-size 2000 \
---num-workers 20 \
---batch-mesh-size 500 \
---force-cpu \
---num-export-workers 20 \
---export-batch-size 400 \
---fast-paraview-export \
---ultra-fast-mode \
---max-chunk-workers 20
+python polyhedron_segmentation.py \
+--input /path/to/generated/file.vti \
+--output /path/to/output/segmentation.json \
+--no-paraview-multiblock 
+--decimation-ratio 0.99 
+--smoothing-iterations 40 
+--erosion-iterations 0 --min-polyhedron-size 100 
+--remove-boundary-polyhedrons 
+--max-voxel-aspect-ratio 0 
+--fast-mesh-extraction 
+--stream-batch-size 0 
+--num-workers 20 
+--batch-mesh-size 0 
+--force-cpu 
+--num-export-workers 20 
+--export-batch-size 400 
+--fast-paraview-export 
+--ultra-fast-mode 
+--max-chunk-workers 20 
+--target-vertices 10 
+--fix-mesh-for-lmgc90
 ```
 
 For enabling chunking, add:
@@ -187,12 +189,13 @@ For specialized railway track granular media generation:
 python railway_track.py --model_path "/path/to/base/model" \
 --inpainting_model_path "/path/to/inpainting/model" \
 --output_dir "/path/to/output/" \
---target_length 1.5 \
+--target_length 16.0 \
 --target_depth 0.3 \
 --target_width 1.2 \
---inference_steps 40 \
+--inference_steps 50 \
 --scheduler_type "ddim" \
---batch_size 16
+--batch_size 16 \
+--seed 484
 ```
 
 ## Additional Tools
