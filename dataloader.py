@@ -76,6 +76,7 @@ class VoxelDataset(Dataset):
         sdf=True,
         interpol=False,
         sdf_scale=5.0,
+        load_conditioning=True,  # whether to load conditioning statistics
     ):
         """
         Initialize the VoxelDataset.
@@ -92,12 +93,14 @@ class VoxelDataset(Dataset):
         self.percentage = percentage
         self.interpol = interpol
         self.target_size = (64, 64, 64) if interpol else voxel_size
+        self.load_conditioning = load_conditioning
 
         # Initialize variables
         self.axis_stats = None
         self.file_cache = OrderedDict()
         self.h5f = None
         self.voxels_h5 = None
+        self.conditioning_stats_h5 = None  # for conditioning statistics
         self.total_voxels_in_h5 = None
 
         # Generate cache key
@@ -117,6 +120,9 @@ class VoxelDataset(Dataset):
         self.sdf = sdf
         self.sdf_scale = sdf_scale
         self.sdf_cache = {}
+
+        # Initialize conditioning data
+        self.conditioning_data_in_memory = None
 
     def _load_data_into_memory(self):
         """
@@ -162,7 +168,23 @@ class VoxelDataset(Dataset):
             self.data_in_memory.append(processed_batch)
 
         self.data_in_memory = np.concatenate(self.data_in_memory, axis=0)
+        
+        # Load conditioning data if available
+        if self.conditioning_stats_h5 is not None:
+            print("Loading conditioning stats into memory...")
+            conditioning_data = []
+            for i in tqdm(range(0, total, batch_size), desc="Loading Conditioning Stats"):
+                batch_indices = self.index_mapping[i : i + batch_size]
+                batch_conditioning = self.conditioning_stats_h5[batch_indices]
+                conditioning_data.append(batch_conditioning)
+            
+            self.conditioning_data_in_memory = np.concatenate(conditioning_data, axis=0)
+            print(f"Conditioning data loaded. Shape: {self.conditioning_data_in_memory.shape}")
+        else:
+            self.conditioning_data_in_memory = None
+        
         self.voxels_h5 = None
+        self.conditioning_stats_h5 = None
         self.h5f.close()
         self.h5f = None
         print("Data loading complete.")
@@ -203,6 +225,16 @@ class VoxelDataset(Dataset):
             self.voxels_h5 = self.h5f["voxels"]
             self.total_voxels_in_h5 = self.voxels_h5.shape[0]
             print(f"[Worker {os.getpid()}] HDF5 file opened. Total voxels: {self.total_voxels_in_h5}")
+
+            # Load conditioning stats if available and requested
+            if self.load_conditioning and "conditioning_stats" in self.h5f:
+                self.conditioning_stats_h5 = self.h5f["conditioning_stats"]
+                print(f"[Worker {os.getpid()}] Conditioning stats loaded. Shape: {self.conditioning_stats_h5.shape}")
+            elif self.load_conditioning:
+                print(f"[Worker {os.getpid()}] Warning: Conditioning requested but 'conditioning_stats' not found in HDF5 file")
+                self.conditioning_stats_h5 = None
+            else:
+                self.conditioning_stats_h5 = None
 
             if self.small:
                 subset_percentage = self.percentage
@@ -264,6 +296,8 @@ class VoxelDataset(Dataset):
 
     def __getitem__(self, idx):
         binary_voxel = self.data_in_memory[idx]
+        
+        # Process voxel data
         if self.sdf:
             cache_key = (idx, self.sdf_scale)
 
@@ -274,18 +308,23 @@ class VoxelDataset(Dataset):
                 sdf = self.sdf_cache[cache_key]
 
             voxel_tensor = torch.tensor(sdf, dtype=torch.float32).unsqueeze(0)  # add channel dimension
-
-            if self.transform:
-                voxel_tensor = self.transform(voxel_tensor)
-            return voxel_tensor
         else:
             # remap between -1 and 1 since binary data might {0, 1} was not be good for training
             voxel_minus_one_one = (binary_voxel * 2.0) - 1.0
-
             voxel_tensor = torch.tensor(voxel_minus_one_one, dtype=torch.float32).unsqueeze(0)
 
-            if self.transform:
-                voxel_tensor = self.transform(voxel_tensor)
+        if self.transform:
+            voxel_tensor = self.transform(voxel_tensor)
+        
+        # Return conditioning data if available
+        if self.conditioning_data_in_memory is not None:
+            conditioning_tensor = torch.tensor(self.conditioning_data_in_memory[idx], dtype=torch.float32)
+            return {
+                "voxels": voxel_tensor,
+                "conditioning": conditioning_tensor
+            }
+        else:
+            # Return only voxel data for backward compatibility
             return voxel_tensor
 
     def __del__(self):
@@ -313,6 +352,7 @@ def get_voxel_dataloaders(
     sdf=True,
     interpol=False,
     sdf_scale=5.0,
+    load_conditioning=True,
 ):
     dataset = VoxelDataset(
         h5_file_path=h5_file_path,
@@ -329,6 +369,7 @@ def get_voxel_dataloaders(
         sdf=sdf,
         interpol=interpol,
         sdf_scale=sdf_scale,
+        load_conditioning=load_conditioning,
     )
 
     val_size = int(len(dataset) * val_split)

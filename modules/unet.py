@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from .conditioning import ConditioningEncoder
+from typing import Optional
 
 
 # Adapted from 2D and 3D unets from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets
@@ -386,6 +388,10 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         attention_head_dim=8,  # match huggingface but not yet used
         # Add a flag to know if this model is for inpainting
         inpainting_mode: bool = False,
+        # Conditioning parameters
+        conditioning_dim: Optional[int] = None,  # dimension of conditioning features
+        conditioning_hidden_dim: Optional[int] = None,  # hidden dim for conditioning encoder
+        conditioning_dropout: float = 0.1,  # dropout for conditioning encoder
     ):
         super().__init__()
 
@@ -406,6 +412,18 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         timestep_input_dim = block_out_channels[0]
 
         self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
+
+        # Conditioning encoder
+        self.conditioning_dim = conditioning_dim
+        if conditioning_dim is not None:
+            self.conditioning_encoder = ConditioningEncoder(
+                stats_dim=conditioning_dim,
+                embed_dim=time_embed_dim,
+                hidden_dim=conditioning_hidden_dim,
+                dropout=conditioning_dropout
+            )
+        else:
+            self.conditioning_encoder = None
 
         self.down_blocks = nn.ModuleList([])
         self.mid_block = None
@@ -483,6 +501,7 @@ class UNet3DModel(ModelMixin, ConfigMixin):
         self,
         sample: torch.FloatTensor,  # if inpainting mode, this is the concat [latent, mask, masked_latent]
         timestep: torch.LongTensor,
+        conditioning_stats: Optional[torch.FloatTensor] = None,  # conditioning features
         return_dict: bool = True,
     ):
         # 1. Check inputs, inpainting or not.
@@ -516,6 +535,26 @@ class UNet3DModel(ModelMixin, ConfigMixin):
 
         t_emb = self.time_proj(timestep)
         emb = self.time_embedding(t_emb)
+
+        # 3. Conditioning embedding and combination
+        if conditioning_stats is not None and self.conditioning_encoder is not None:
+            # Validate conditioning input
+            if conditioning_stats.dim() != 2:
+                raise ValueError(f"conditioning_stats should be 2D tensor, got {conditioning_stats.dim()}D")
+            if conditioning_stats.shape[0] != sample.shape[0]:
+                raise ValueError(f"Batch size mismatch: conditioning_stats {conditioning_stats.shape[0]} vs sample {sample.shape[0]}")
+            if conditioning_stats.shape[1] != self.conditioning_dim:
+                raise ValueError(f"conditioning_stats feature dim {conditioning_stats.shape[1]} != expected {self.conditioning_dim}")
+            
+            # Encode conditioning features
+            cond_emb = self.conditioning_encoder(conditioning_stats)
+            
+            # Combine time and conditioning embeddings
+            emb = emb + cond_emb
+        elif self.conditioning_encoder is not None and conditioning_stats is None:
+            # Warning: conditioning encoder is available but no conditioning provided
+            # This is expected during CFG when using null conditioning
+            pass
 
         # 4. Initial convolution
         h = self.conv_in(model_input)  # pass the potentially concatenated input

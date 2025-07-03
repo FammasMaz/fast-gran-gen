@@ -112,6 +112,39 @@ def get_args():
         "--save_ema_as_final", type=str2bool, default=True, help="Save EMA weights as the final model."
     )
 
+    ##### Conditioning Configuration #####
+    parser.add_argument(
+        "--conditioning_mode", type=str2bool, default=False, help="Enable conditioning for controllable generation."
+    )
+    parser.add_argument(
+        "--conditioning_dim", type=int, default=8, help="Dimension of conditioning features."
+    )
+    parser.add_argument(
+        "--conditioning_hidden_dim", type=int, default=None, help="Hidden dimension for conditioning encoder (defaults to time embedding dim)."
+    )
+    parser.add_argument(
+        "--conditioning_dropout", type=float, default=0.1, help="Dropout probability for conditioning encoder."
+    )
+    parser.add_argument(
+        "--cfg_dropout_prob", type=float, default=0.1, help="Conditioning dropout probability for CFG training."
+    )
+    parser.add_argument(
+        "--guidance_scale", type=float, default=7.5, help="Guidance scale for classifier-free guidance."
+    )
+    parser.add_argument(
+        "--conditioning_features", type=str, nargs='+', 
+        default=['density', 'volume', 'num_components', 'largest_component_ratio',
+                'surface_to_volume_ratio', 'bbox_fill_ratio', 'aspect_ratio_dh', 'aspect_ratio_hw'],
+        help="List of conditioning features to use."
+    )
+    parser.add_argument(
+        "--normalization_params_path", type=str, default="preprocessing/output/normalization_params.json",
+        help="Path to normalization parameters file for conditioning features."
+    )
+    parser.add_argument(
+        "--load_conditioning", type=str2bool, default=True, help="Load conditioning data from dataset."
+    )
+
     ##### Inpainting Mode and Mask Configuration #####
 
     parser.add_argument(
