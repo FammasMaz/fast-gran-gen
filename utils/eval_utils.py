@@ -421,6 +421,175 @@ def generate_cpu_overlapping_volume(
 
 
 ## inpainting version
+def batch_inpaint_junctions(
+    full_volume_pt,
+    junction_infos,
+    inpainting_pipeline,
+    num_inference_steps,
+    device,
+    args,
+    seed,
+    use_gap_filling=False,
+    output_dir=None,
+    inpaint_iteratively=False,
+    inpaint_iterations=3,
+    inpaint_region_size_ratio=0.3,
+):
+    """
+    Batch process multiple junctions for inpainting to leverage GPU parallelization.
+    
+    Args:
+        full_volume_pt: The full volume tensor on GPU
+        junction_infos: List of junction information dictionaries
+        inpainting_pipeline: Loaded inpainting pipeline
+        num_inference_steps: Number of diffusion steps
+        device: GPU device
+        args: Arguments containing mask configuration
+        seed: Random seed base
+        use_gap_filling: Whether using gap filling mode
+        output_dir: Debug output directory
+        inpaint_iteratively: Whether to use iterative inpainting
+        inpaint_iterations: Number of iterations for iterative inpainting
+        inpaint_region_size_ratio: Size ratio for inpainting region
+    
+    Returns:
+        Updated full_volume_pt with inpainted junctions
+    """
+    if not junction_infos:
+        return full_volume_pt
+    
+    inpainting_unet = inpainting_pipeline.unet
+    inpainting_scheduler = inpainting_pipeline.scheduler
+    inpainting_scheduler.set_timesteps(num_inference_steps)
+    inpainting_unet.eval()
+    
+    # Extract all junction regions and create masks
+    batch_image_slices = []
+    batch_masks = []
+    batch_regions = []
+    
+    logger.info(f"Preparing batch of {len(junction_infos)} junctions for parallel inpainting")
+    
+    for i, junction_info in enumerate(junction_infos):
+        region_start_d = junction_info['region_start_d']
+        region_end_d = junction_info['region_end_d']
+        junction_center_d = junction_info['junction_center_d']
+        gap_size = junction_info.get('gap_size', 0)
+        
+        # Extract junction slice
+        image_slice = full_volume_pt[0, :, region_start_d:region_end_d, :, :].clone()
+        batch_image_slices.append(image_slice)
+        batch_regions.append((region_start_d, region_end_d))
+        
+        # Create mask for this junction
+        region_depth = region_end_d - region_start_d
+        junction_local_center = junction_center_d - region_start_d
+        
+        if use_gap_filling:
+            mask_width = gap_size
+        else:
+            mask_width = int(region_depth * inpaint_region_size_ratio)
+        
+        mask_start = max(0, junction_local_center - mask_width // 2)
+        mask_end = min(region_depth, mask_start + mask_width)
+        
+        mask = torch.zeros_like(image_slice)
+        mask[:, mask_start:mask_end, :, :] = 1.0
+        batch_masks.append(mask)
+    
+    # Stack into batch tensors
+    batch_image_slices = torch.stack(batch_image_slices, dim=0)  # (B, C, D, H, W)
+    batch_masks = torch.stack(batch_masks, dim=0)  # (B, C, D, H, W)
+    batch_mask_unet_input = batch_masks[:, 0:1, ...].to(device)  # (B, 1, D, H, W)
+    
+    # Move to device
+    batch_image_slices = batch_image_slices.to(device)
+    batch_masks = batch_masks.to(device)
+    
+    # Generate seeds for each junction
+    batch_generators = []
+    for i in range(len(junction_infos)):
+        junction_seed = seed + i * 1000
+        generator = torch.Generator(device=device).manual_seed(junction_seed)
+        batch_generators.append(generator)
+    
+    # Main batch inpainting process
+    logger.info(f"Starting batch inpainting for {len(junction_infos)} junctions")
+    
+    try:
+        timesteps = inpainting_scheduler.timesteps
+        
+        # Create initial noise for entire batch
+        batch_latents = torch.randn(batch_image_slices.shape, device=device)
+        
+        # Create masked images for entire batch
+        batch_masked_images = batch_image_slices * (1.0 - batch_masks) - batch_masks
+        
+        # Scale initial noise if needed
+        if hasattr(inpainting_scheduler, "init_noise_sigma"):
+            batch_latents = batch_latents * inpainting_scheduler.init_noise_sigma
+        
+        with torch.inference_mode():
+            for i_step, t in enumerate(tqdm(timesteps, desc="Batch Inpainting", leave=False)):
+                # Prepare batch input for UNet
+                t_input = t.repeat(batch_image_slices.shape[0])  # Batch size
+                
+                # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
+                unet_input = torch.cat([batch_latents, batch_mask_unet_input, batch_masked_images], dim=1)
+                
+                # Batch predict noise
+                noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
+                
+                # Batch scheduler step
+                step_output = inpainting_scheduler.step(noise_pred, t, batch_latents)
+                x_prev_denoised_candidate = step_output.prev_sample
+                
+                # RePaint-like guidance for batch
+                if i_step < len(timesteps) - 1:
+                    prev_t = timesteps[i_step + 1]
+                    noise_for_gt_conditioning = torch.randn(
+                        batch_image_slices.shape, device=device, dtype=batch_image_slices.dtype
+                    )
+                    
+                    # Add noise to original images
+                    x_prev_noised_known_gt = inpainting_scheduler.add_noise(
+                        batch_image_slices, noise_for_gt_conditioning, prev_t.unsqueeze(0)
+                    )
+                    
+                    # Composite: use inpainted prediction for masked areas, noisy GT for known areas
+                    batch_latents = x_prev_denoised_candidate * batch_masks + x_prev_noised_known_gt * (1.0 - batch_masks)
+                else:
+                    # Last step: composite final x0 prediction
+                    batch_latents = x_prev_denoised_candidate * batch_masks + batch_image_slices * (1.0 - batch_masks)
+        
+        # Place results back into full volume
+        for i, (region_start_d, region_end_d) in enumerate(batch_regions):
+            full_volume_pt[0, :, region_start_d:region_end_d, :, :] = batch_latents[i]
+        
+        logger.info(f"Batch inpainting completed for {len(junction_infos)} junctions")
+        
+        # Save debug outputs if requested
+        if output_dir:
+            debug_dir = Path(output_dir) / f"batch_inpainting_debug_seed{seed}"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            for i in range(len(junction_infos)):
+                result_np = pt_to_numpy(batch_latents[i])
+                np.save(debug_dir / f"batch_junction_{i:02d}.npy", result_np)
+        
+    except Exception as e:
+        logger.error(f"Error in batch inpainting: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fall back to sequential processing
+        return full_volume_pt
+    
+    # Cleanup
+    del batch_image_slices, batch_masks, batch_latents, batch_masked_images
+    torch.cuda.empty_cache()
+    
+    return full_volume_pt
+
+
 def generate_stitched_volume_with_inpainting(
     base_unet,
     base_scheduler,
@@ -596,26 +765,14 @@ def generate_stitched_volume_with_inpainting(
     full_volume_pt = full_volume_pt.to(device)
     torch.cuda.empty_cache()
 
-    # inpainting seams
-    inpainting_unet = inpainting_pipeline.unet
-    inpainting_scheduler = inpainting_pipeline.scheduler
-    inpainting_scheduler.set_timesteps(num_inference_steps)
-    inpainting_unet.eval()
-
-    pbar_inp = tqdm(total=n_blocks - 1, desc="Inpainting Junction Regions")
+    # inpainting seams using batch processing
+    logger.info("Preparing junction information for batch inpainting")
+    
+    # Collect all junction information first
+    junction_infos = []
     inpainting_base_seed = seed + n_blocks
-
+    
     for i in range(n_blocks - 1):
-        image_slice = None
-        mask = None
-        image_slice_b = None
-        mask_b = None
-        mask_unet_input_b = None
-        latents = None
-        inpainted_result_latent = None
-        noise_pred = None
-        prev_sample = None
-
         junction_idx = i + 1
 
         if use_gap_filling:
@@ -640,295 +797,46 @@ def generate_stitched_volume_with_inpainting(
             region_end_d = total_depth
             region_depth = region_end_d - region_start_d
 
+        # Collect junction information for batch processing
+        junction_info = {
+            'junction_idx': junction_idx,
+            'region_start_d': region_start_d,
+            'region_end_d': region_end_d,
+            'junction_center_d': junction_center_d,
+            'region_depth': region_depth
+        }
+        
+        if use_gap_filling:
+            junction_info['gap_size'] = gap_size
+            
+        junction_infos.append(junction_info)
+        
         logger.info(
-            f"Processing junction {i + 1}/{n_blocks - 1} from depth {region_start_d} to {region_end_d} (size: {region_depth})"
+            f"Prepared junction {i + 1}/{n_blocks - 1} from depth {region_start_d} to {region_end_d} (size: {region_depth})"
         )
-
-        image_slice = full_volume_pt[0, :C, region_start_d:region_end_d, :, :].clone()
-        logger.debug(f"  Extracted junction slice shape: {image_slice.shape}")
-
-        if inpaint_iteratively:
-            junction_local_center = junction_center_d - region_start_d
-
-            iter_sizes = []
-            if use_gap_filling:
-                # In gap mode, base mask width should cover the gap area
-                base_mask_width = gap_size
-            else:
-                # In overlap mode, use region ratio
-                base_mask_width = int(region_depth * inpaint_region_size_ratio)
-            for iter_idx in range(inpaint_iterations):
-                size_factor = 1.0 - (iter_idx / inpaint_iterations) * 0.6  # Reduce up to 60%
-                iter_sizes.append(int(base_mask_width * size_factor))
-
-            logger.info(f"  Iterative inpainting with {inpaint_iterations} iterations, mask sizes: {iter_sizes}")
-
-            for iter_idx, mask_width in enumerate(iter_sizes):
-                logger.info(f"  Iteration {iter_idx + 1}/{inpaint_iterations} with mask width {mask_width}")
-
-                mask_start = max(0, junction_local_center - mask_width // 2)
-                mask_end = min(region_depth, mask_start + mask_width)
-
-                mask = torch.zeros_like(image_slice)
-                mask[:, mask_start:mask_end, :, :] = 1.0
-
-                mask_b = mask.unsqueeze(0)
-                mask_unet_input_b = mask[0:1, ...].repeat(1, 1, 1, 1, 1)  # (B=1, C=1, D, H, W)
-                image_slice_b = image_slice.unsqueeze(0)
-
-                mask_b = mask_b.to(device)
-                mask_unet_input_b = mask_unet_input_b.to(device)
-                image_slice_b = image_slice_b.to(device)
-
-                iter_seed = inpainting_base_seed + i * inpaint_iterations + iter_idx
-                generator = torch.Generator(device=device).manual_seed(iter_seed)
-
-                try:
-                    # Set up the diffusion process
-                    inpainting_scheduler.set_timesteps(num_inference_steps)
-                    timesteps = inpainting_scheduler.timesteps
-
-                    # Create initial noise
-                    latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
-
-                    masked_images = image_slice_b * (1.0 - mask_b) - mask_b
-
-                    # Scale initial noise if needed
-                    if hasattr(inpainting_scheduler, "init_noise_sigma"):
-                        latents = latents * inpainting_scheduler.init_noise_sigma
-
-                    with torch.no_grad():
-                        for i_step, t in enumerate(
-                            tqdm(timesteps, desc=f"  Inpainting Iteration {iter_idx + 1}", leave=False)
-                        ):
-                            t_input = t.repeat(image_slice_b.shape[0])  # Batch size
-
-                            # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
-                            unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
-
-                            # Predict noise
-                            noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
-
-                            # Scheduler step
-                            step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
-                            x_prev_denoised_candidate = step_output.prev_sample
-
-                            # RePaint-like guidance: ensure known regions stay consistent
-                            if i_step < len(timesteps) - 1:
-                                # Add noise to the original image for the next timestep
-                                prev_t = timesteps[i_step + 1]
-                                noise_for_gt_conditioning = torch.randn(
-                                    image_slice_b.shape, device=device, dtype=image_slice_b.dtype
-                                )
-
-                                # Always use the original scheduler for adding noise (matches training)
-                                x_prev_noised_known_gt = inpainting_scheduler.add_noise(
-                                    image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
-                                )
-
-                                # Composite: use inpainted prediction for masked areas, noisy GT for known areas
-                                latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
-                            else:
-                                # Last step: composite final x0 prediction
-                                latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
-
-                    image_slice = latents.squeeze(0)
-
-                    if output_dir:
-                        debug_dir = Path(output_dir) / f"inpainting_debug_seed{seed}"
-                        debug_dir.mkdir(parents=True, exist_ok=True)
-                        iter_result_np = pt_to_numpy(image_slice)
-                        np.save(debug_dir / f"junction_{i:02d}_iter_{iter_idx:02d}.npy", iter_result_np)
-
-                except Exception as e:
-                    logger.error(f"Error in iterative inpainting {i + 1}, iteration {iter_idx + 1}: {e}")
-                    import traceback
-
-                    traceback.print_exc()
-                    continue
-
-            inpainted_result_latent = image_slice.unsqueeze(0)
-
-        else:
-            # Get dimensions for mask creation
-            # image_slice shape is (C, region_depth, H, W)
-            _, current_region_depth, current_H, current_W = image_slice.shape
-
-            if use_gap_filling:
-                logger.info(f"  Creating gap mask for junction {i + 1} (gap_filling_compatible mode)")
-
-                # Create a mask that covers the gap region in the center
-                junction_local_center = junction_center_d - region_start_d
-                mask_width = gap_size
-
-                mask_start = max(0, junction_local_center - mask_width // 2)
-                mask_end = min(current_region_depth, mask_start + mask_width)
-
-                mask = torch.zeros((1, current_region_depth, current_H, current_W), device=device)
-                mask[:, mask_start:mask_end, :, :] = 1.0
-
-                logger.info(f"  Created gap mask: width={mask_width}, start={mask_start}, end={mask_end}")
-            else:
-                logger.info(
-                    f"  Generating mask for junction {i + 1} using MaskGenerator3D with args.mask_type: {args.mask_type}"
-                )
-
-                # Instantiate the mask generator with the main args (which includes central_large_block settings)
-                # The MaskGenerator3D will use args.mask_type and related parameters.
-                junction_mask_generator = MaskGenerator3D(args, num_channels=1)
-                # Generate the mask for the current junction slice (Batch=1, Channels=1)
-                mask_for_junction = junction_mask_generator([1, 1, current_region_depth, current_H, current_W])
-                mask = mask_for_junction.squeeze(0).to(device)  # Remove batch dim -> (1, D, H, W)
-
-            logger.info(f"  Generated mask shape for junction: {mask.shape}")
-
-            # The mask input to the UNet usually has only 1 channel.
-            mask_unet_input = mask.unsqueeze(0)  # Add Batch dim back -> (1, 1, D, H, W)
-
-            if output_dir:
-                debug_dir = Path(output_dir) / f"inpainting_debug_seed{seed}"
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                # Convert to numpy and save
-                slice_np = pt_to_numpy(image_slice)
-                mask_np = pt_to_numpy(mask[0])  # Just the first channel for visualization
-                np.save(debug_dir / f"junction_{i:02d}_original.npy", slice_np)
-                np.save(debug_dir / f"junction_{i:02d}_mask.npy", mask_np)
-                logger.info(f"  Saved debug images to {debug_dir}")
-
-            # Add batch dimension
-            image_slice_b = image_slice.unsqueeze(0)  # (1, C, region_depth, H, W)
-            mask_b = mask.unsqueeze(0).to(device)  # (1, 1, D, H, W)
-
-            # mask_unet_input_b is what's concatenated to the latents for the UNet
-            # This is usually (B, 1, D, H, W)
-            mask_unet_input_b = mask_unet_input  # Already (1, 1, D, H, W)
-
-            # Ensure everything is on the correct device
-            image_slice_b = image_slice_b.to(device)
-            # mask_b already on device
-            mask_unet_input_b = mask_unet_input_b.to(device)
-
-            # Prepare generator for inpainting this junction
-            junction_seed = inpainting_base_seed + i
-            generator = torch.Generator(device=device).manual_seed(junction_seed)
-
-            # Prepare initial latents (noise) for the inpainting region
-            latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
-
-            # Manual inpainting loop
-            try:
-                # Similar to before, but adjusted for central block approach
-                inpainting_scheduler.set_timesteps(num_inference_steps)
-                start_timestep_idx = 0  # Start from full noise for better coherence
-                timesteps = inpainting_scheduler.timesteps[start_timestep_idx:]
-                logger.debug(f"  Starting inpainting with {len(timesteps)} steps")
-
-                # Instead of adding noise to a non-masked image, start with pure noise
-                # and conditionally denoise, using the non-masked parts as guidance
-                latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
-
-                masked_images = image_slice_b * (1.0 - mask_b) - mask_b
-
-                # Scale initial noise if needed
-                if hasattr(inpainting_scheduler, "init_noise_sigma"):
-                    latents = latents * inpainting_scheduler.init_noise_sigma
-
-                with torch.no_grad():
-                    for i_step, t in enumerate(tqdm(timesteps, desc=f"  Inpainting Junction {i + 1}", leave=False)):
-                        t_input = t.repeat(image_slice_b.shape[0])  # Batch size
-
-                        # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
-                        unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
-
-                        # Predict noise
-                        noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
-
-                        # Scheduler step
-                        step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
-                        x_prev_denoised_candidate = step_output.prev_sample
-
-                        # RePaint-like guidance: ensure known regions stay consistent
-                        if i_step < len(timesteps) - 1:
-                            # Add noise to the original image for the next timestep
-                            prev_t = timesteps[i_step + 1]
-                            noise_for_gt_conditioning = torch.randn(
-                                image_slice_b.shape, device=device, dtype=image_slice_b.dtype
-                            )
-
-                            # Always use the original scheduler for adding noise (matches training)
-                            x_prev_noised_known_gt = inpainting_scheduler.add_noise(
-                                image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
-                            )
-
-                            # Composite: use inpainted prediction for masked areas, noisy GT for known areas
-                            latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
-                        else:
-                            # Last step: composite final x0 prediction
-                            latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
-
-                # Final result
-                inpainted_result_latent = latents
-                logger.info(f"  Junction {i + 1} inpainting complete")
-
-                # Save the inpainted result for debugging
-                if output_dir:
-                    inpainted_np = pt_to_numpy(inpainted_result_latent.squeeze(0))
-                    np.save(debug_dir / f"junction_{i:02d}_inpainted.npy", inpainted_np)
-
-            except Exception as e:
-                logger.error(f"Error inpainting junction {i + 1}: {e}")
-                import traceback
-
-                traceback.print_exc()
-                pbar_inp.close()
-                # Clean up before returning None
-                if image_slice is not None:
-                    del image_slice
-                if mask is not None:
-                    del mask
-                if image_slice_b is not None:
-                    del image_slice_b
-                if mask_b is not None:
-                    del mask_b
-                if mask_unet_input_b is not None:
-                    del mask_unet_input_b
-                if latents is not None:
-                    del latents
-                if noise_pred is not None:
-                    del noise_pred
-                if prev_sample is not None:
-                    del prev_sample
-                if inpainted_result_latent is not None:
-                    del inpainted_result_latent
-                torch.cuda.empty_cache()
-                return None
-
-        full_volume_pt[0, :, region_start_d:region_end_d, :, :] = inpainted_result_latent.squeeze(0)
-        logger.info(f"  Placed inpainted junction {i + 1} back into full volume")
-
-        if image_slice is not None:
-            del image_slice
-        if mask is not None:
-            del mask
-        if image_slice_b is not None:
-            del image_slice_b
-        if mask_b is not None:
-            del mask_b
-        if mask_unet_input_b is not None:
-            del mask_unet_input_b
-        if latents is not None:
-            del latents
-        if noise_pred is not None:
-            del noise_pred
-        if prev_sample is not None:
-            del prev_sample
-        if inpainted_result_latent is not None:
-            del inpainted_result_latent
-        torch.cuda.empty_cache()
-        pbar_inp.update(1)
-
-    pbar_inp.close()
-    logger.info("Inpainting completed.")
+    
+    # Handle iterative inpainting fallback (not yet implemented for batch processing)
+    if inpaint_iteratively:
+        logger.warning("Iterative inpainting not yet implemented for batch processing. Falling back to single-pass batch inpainting.")
+    
+    # Perform batch inpainting on all collected junctions
+    if junction_infos:
+        full_volume_pt = batch_inpaint_junctions(
+            full_volume_pt=full_volume_pt,
+            junction_infos=junction_infos,
+            inpainting_pipeline=inpainting_pipeline,
+            num_inference_steps=num_inference_steps,
+            device=device,
+            args=args,
+            seed=inpainting_base_seed,
+            use_gap_filling=use_gap_filling,
+            output_dir=output_dir,
+            inpaint_iteratively=False,  # Not implemented for batch yet
+            inpaint_iterations=inpaint_iterations,
+            inpaint_region_size_ratio=inpaint_region_size_ratio,
+        )
+    
+    logger.info("Batch inpainting completed.")
     final_volume_np = pt_to_numpy(full_volume_pt.squeeze(0))  # Remove Batch dim
 
     if final_volume_np.shape[0] == 1:
