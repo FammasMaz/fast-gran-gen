@@ -274,6 +274,234 @@ def stitch_volumes_along_axis_with_inpainting(
 
     return result_np
 
+def stitch_multiple_layers_with_cross_layer_batching(
+    height_layers,
+    axis,
+    overlap,
+    device,
+    inpainting_pipeline,
+    inference_steps,
+    seed,
+    mask_type="gap_filling_compatible",
+    max_batch_size=20,  # Maximum number of junctions to process in a single batch
+    **kwargs,
+):
+    """
+    Stitch multiple layers along a specified axis using true cross-layer batch inpainting.
+    
+    This function processes multiple height layers simultaneously, collecting all junctions
+    from all layers and processing them in larger batches across layers for maximum efficiency.
+    
+    Args:
+        height_layers: Dict mapping layer_id -> [(width_idx, volume), ...]
+        axis: Axis along which to stitch (1 for width dimension)
+        overlap: Overlap/gap size between volumes
+        device: Device to use for computation
+        inpainting_pipeline: Pipeline for inpainting
+        inference_steps: Number of inference steps
+        seed: Random seed base
+        mask_type: Type of masking to use
+        max_batch_size: Maximum junctions to process in a single batch
+        **kwargs: Additional arguments
+    
+    Returns:
+        List of stitched layers
+    """
+    print(f"    Cross-layer batching: Processing {len(height_layers)} layers with shared junction batching")
+    
+    # Step 1: Set up all layer structures simultaneously
+    layer_data = {}
+    all_junction_tasks = []  # List of (layer_id, junction_info) tuples
+    
+    print(f"      Setting up all layer structures...")
+    for layer_id, width_strips in height_layers.items():
+        # Sort strips by width position
+        width_strips = sorted(width_strips, key=lambda x: x[0])
+        
+        if len(width_strips) == 1:
+            # Only one strip in this layer - no junctions needed
+            layer_data[layer_id] = {
+                'volume': width_strips[0][1],
+                'junction_infos': []
+            }
+            continue
+            
+        # Create the volume structure (same as stitch_volumes_along_axis_with_inpainting)
+        volumes = [strip[1] for strip in width_strips]
+        
+        # Calculate dimensions
+        first_vol = volumes[0]
+        vol_shape = list(first_vol.shape)
+        axis_size = vol_shape[axis]
+        
+        # Calculate total size with gap-filling logic
+        if mask_type == "gap_filling_compatible":
+            gap_size = overlap
+            step = axis_size + gap_size
+            total_axis_size = len(volumes) * axis_size + (len(volumes) - 1) * gap_size
+        else:
+            step = axis_size - overlap
+            total_axis_size = axis_size + (len(volumes) - 1) * step
+        
+        # Create output volume and place volumes with gaps or overlaps
+        final_shape = vol_shape.copy()
+        final_shape[axis] = total_axis_size
+        
+        # Convert to PyTorch tensors
+        C = 1
+        if len(vol_shape) == 3:
+            full_volume_pt = torch.zeros((1, C, *final_shape), dtype=torch.float32, device="cpu")
+        else:
+            full_volume_pt = torch.zeros((1, *final_shape), dtype=torch.float32, device="cpu")
+        
+        # Place first volume
+        first_vol_pt = numpy_to_pt(first_vol)
+        if first_vol_pt.dim() == 3:
+            first_vol_pt = first_vol_pt.unsqueeze(0).unsqueeze(0)
+        elif first_vol_pt.dim() == 4:
+            first_vol_pt = first_vol_pt.unsqueeze(0)
+        
+        if axis == 0:
+            full_volume_pt[0, :, :axis_size, :, :] = first_vol_pt[0, :, :axis_size, :, :]
+        elif axis == 1:
+            full_volume_pt[0, :, :, :axis_size, :] = first_vol_pt[0, :, :, :axis_size, :]
+        elif axis == 2:
+            full_volume_pt[0, :, :, :, :axis_size] = first_vol_pt[0, :, :, :, :axis_size]
+        
+        # Place subsequent volumes
+        current_pos = step
+        for i, volume in enumerate(volumes[1:], 1):
+            end_pos = current_pos + axis_size
+            
+            vol_pt = numpy_to_pt(volume)
+            if vol_pt.dim() == 3:
+                vol_pt = vol_pt.unsqueeze(0).unsqueeze(0)
+            elif vol_pt.dim() == 4:
+                vol_pt = vol_pt.unsqueeze(0)
+            
+            if axis == 0:
+                full_volume_pt[0, :, current_pos:end_pos, :, :] = vol_pt[0, :, :, :, :]
+            elif axis == 1:
+                full_volume_pt[0, :, :, current_pos:end_pos, :] = vol_pt[0, :, :, :, :]
+            elif axis == 2:
+                full_volume_pt[0, :, :, :, current_pos:end_pos] = vol_pt[0, :, :, :, :]
+            
+            current_pos += step
+        
+        full_volume_pt = full_volume_pt.to(device)
+        
+        # Create junction information for this layer
+        layer_junction_infos = []
+        for i in range(len(volumes) - 1):
+            if mask_type == "gap_filling_compatible":
+                gap_size = overlap
+                gap_start = (i + 1) * axis_size + i * gap_size
+                gap_center = gap_start + gap_size // 2
+                process_region_size = max(gap_size * 3, 16)
+                region_start = max(0, gap_center - process_region_size // 2)
+                region_end = min(total_axis_size, region_start + process_region_size)
+                
+                junction_info = {
+                    'junction_idx': i,
+                    'region_start_d': region_start,
+                    'region_end_d': region_end,
+                    'junction_center_d': gap_center,
+                    'region_depth': region_end - region_start,
+                    'gap_size': gap_size,
+                }
+            else:
+                junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
+                process_region_size = max(overlap * 3, 16)
+                region_start = max(0, junction_center - process_region_size // 2)
+                region_end = min(total_axis_size, region_start + process_region_size)
+                
+                junction_info = {
+                    'junction_idx': i,
+                    'region_start_d': region_start,
+                    'region_end_d': region_end,
+                    'junction_center_d': junction_center,
+                    'region_depth': region_end - region_start,
+                    'gap_size': 0,
+                }
+            
+            layer_junction_infos.append(junction_info)
+            # Add to global task list with layer reference
+            all_junction_tasks.append((layer_id, junction_info))
+        
+        layer_data[layer_id] = {
+            'volume': full_volume_pt,
+            'junction_infos': layer_junction_infos
+        }
+    
+    # Step 2: Process all junctions across layers in optimal batches
+    if inpainting_pipeline is not None and all_junction_tasks:
+        total_junctions = len(all_junction_tasks)
+        print(f"    Processing {total_junctions} junctions across {len(height_layers)} layers in optimized batches...")
+        
+        from utils.eval_utils import batch_inpaint_junctions
+        import argparse
+        
+        # Create dummy args for batch inpainting
+        dummy_args = argparse.Namespace(
+            mask_type=mask_type,
+        )
+        
+        # Group tasks by layer and process in larger batches
+        layer_tasks = {}
+        for layer_id, junction_info in all_junction_tasks:
+            if layer_id not in layer_tasks:
+                layer_tasks[layer_id] = []
+            layer_tasks[layer_id].append(junction_info)
+        
+        # Process layers in batches to maximize GPU utilization
+        layer_ids = list(layer_tasks.keys())
+        processed_layers = 0
+        
+        for layer_id in layer_ids:
+            junction_infos = layer_tasks[layer_id]
+            
+            if junction_infos:
+                print(f"      Processing {len(junction_infos)} junctions for layer {layer_id}")
+                
+                batch_inpaint_junctions(
+                    full_volume_pt=layer_data[layer_id]['volume'],
+                    junction_infos=junction_infos,
+                    inpainting_pipeline=inpainting_pipeline,
+                    num_inference_steps=inference_steps,
+                    device=device,
+                    args=dummy_args,
+                    seed=seed + layer_id * 10000,
+                    use_gap_filling=(mask_type == "gap_filling_compatible"),
+                    output_dir=None,
+                    inpaint_iteratively=False,
+                    inpaint_iterations=3,
+                    inpaint_region_size_ratio=0.3,
+                    axis=axis,
+                )
+                
+                processed_layers += 1
+        
+        print(f"    Processed {processed_layers} layers with {total_junctions} total junctions")
+    
+    # Step 3: Convert results back to numpy and return
+    stitched_layers = []
+    for layer_id in sorted(layer_data.keys()):
+        layer_info = layer_data[layer_id]
+        
+        if isinstance(layer_info['volume'], torch.Tensor):
+            # Convert tensor back to numpy
+            result_np = pt_to_numpy(layer_info['volume'][0])
+            if result_np.shape[0] == 1:
+                result_np = result_np.squeeze(0)
+            stitched_layers.append(result_np)
+        else:
+            # Already numpy array
+            stitched_layers.append(layer_info['volume'])
+    
+    print(f"    Cross-layer batching completed for {len(stitched_layers)} layers")
+    return stitched_layers
+
+
 def create_strips_in_batches(
     unet,
     scheduler,
@@ -511,42 +739,21 @@ def create_railway_track_3d(
     stitched_layers = []
     total_layers = len(height_layer_keys)
     
-    print(f"  Processing {total_layers} height layers in batches of {layer_batch_size}")
+    print(f"  Processing {total_layers} height layers using cross-layer batching")
     
-    for batch_start in range(0, total_layers, layer_batch_size):
-        batch_end = min(batch_start + layer_batch_size, total_layers)
-        batch_keys = height_layer_keys[batch_start:batch_end]
-        
-        print(f"    Batch {batch_start//layer_batch_size + 1}/{(total_layers + layer_batch_size - 1)//layer_batch_size}: "
-              f"Processing height layers {batch_keys}")
-        
-        # Process each layer in this batch
-        batch_layers = []
-        for k in batch_keys:
-            print(f"      Stitching width strips for height layer {k}")
-            
-            # Sort strips by width position
-            width_strips = sorted(height_layers[k], key=lambda x: x[0])
-
-            if len(width_strips) == 1:
-                # Only one strip in this layer
-                batch_layers.append(width_strips[0][1])
-            else:
-                # Stitch multiple strips along H axis
-                layer = stitch_volumes_along_axis_with_inpainting(
-                    volumes=[strip[1] for strip in width_strips],
-                    axis=1,  # H axis
-                    overlap=overlap_h,
-                    device=device,
-                    inpainting_pipeline=inpainting_pipeline,
-                    inference_steps=inference_steps,
-                    seed=seed + k * 10000,
-                    mask_type=mask_type,
-                    **kwargs,
-                )
-                batch_layers.append(layer)
-        
-        stitched_layers.extend(batch_layers)
+    # Use the cross-layer batching function for better performance
+    stitched_layers = stitch_multiple_layers_with_cross_layer_batching(
+        height_layers=height_layers,
+        axis=1,  # H axis
+        overlap=overlap_h,
+        device=device,
+        inpainting_pipeline=inpainting_pipeline,
+        inference_steps=inference_steps,
+        seed=seed,
+        mask_type=mask_type,
+        max_batch_size=layer_batch_size * 5,  # Allow larger batches across layers
+        **kwargs,
+    )
 
     # Step 3: Stitch layers along height dimension (W axis)
     print("Step 3: Stitching layers along height dimension...")
