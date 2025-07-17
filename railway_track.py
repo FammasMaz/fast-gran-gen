@@ -443,6 +443,7 @@ def create_railway_track_3d(
     binary=False,
     debug=False,
     strip_batch_size=4,
+    layer_batch_size=4,  # New parameter for height layer batching
     **kwargs,
 ):
     """
@@ -504,30 +505,48 @@ def create_railway_track_3d(
             height_layers[k] = []
         height_layers[k].append((j, strip_data["volume"]))
 
+    # Process multiple height layers in parallel batches
+    height_layer_keys = sorted(height_layers.keys())
+    
     stitched_layers = []
-    for k in sorted(height_layers.keys()):
-        print(f"  Stitching width strips for height layer {k}")
+    total_layers = len(height_layer_keys)
+    
+    print(f"  Processing {total_layers} height layers in batches of {layer_batch_size}")
+    
+    for batch_start in range(0, total_layers, layer_batch_size):
+        batch_end = min(batch_start + layer_batch_size, total_layers)
+        batch_keys = height_layer_keys[batch_start:batch_end]
+        
+        print(f"    Batch {batch_start//layer_batch_size + 1}/{(total_layers + layer_batch_size - 1)//layer_batch_size}: "
+              f"Processing height layers {batch_keys}")
+        
+        # Process each layer in this batch
+        batch_layers = []
+        for k in batch_keys:
+            print(f"      Stitching width strips for height layer {k}")
+            
+            # Sort strips by width position
+            width_strips = sorted(height_layers[k], key=lambda x: x[0])
 
-        # Sort strips by width position
-        width_strips = sorted(height_layers[k], key=lambda x: x[0])
-
-        if len(width_strips) == 1:
-            # Only one strip in this layer
-            stitched_layers.append(width_strips[0][1])
-        else:
-            # Stitch multiple strips along H axis
-            layer = stitch_volumes_along_axis_with_inpainting(
-                volumes=[strip[1] for strip in width_strips],
-                axis=1,  # H axis
-                overlap=overlap_h,
-                device=device,
-                inpainting_pipeline=inpainting_pipeline,
-                inference_steps=inference_steps,
-                seed=seed + k * 10000,
-                mask_type=mask_type,
-                **kwargs,
-            )
-            stitched_layers.append(layer)
+            if len(width_strips) == 1:
+                # Only one strip in this layer
+                batch_layers.append(width_strips[0][1])
+            else:
+                # Stitch multiple strips along H axis
+                layer = stitch_volumes_along_axis_with_inpainting(
+                    volumes=[strip[1] for strip in width_strips],
+                    axis=1,  # H axis
+                    overlap=overlap_h,
+                    device=device,
+                    inpainting_pipeline=inpainting_pipeline,
+                    inference_steps=inference_steps,
+                    seed=seed + k * 10000,
+                    mask_type=mask_type,
+                    **kwargs,
+                )
+                batch_layers.append(layer)
+        
+        stitched_layers.extend(batch_layers)
 
     # Step 3: Stitch layers along height dimension (W axis)
     print("Step 3: Stitching layers along height dimension...")
@@ -633,6 +652,7 @@ def create_railway_track(
             overlap_w=overlap_l,
             debug=debug,
             strip_batch_size=strip_batch_size,
+            layer_batch_size=4,  # Default layer batch size
             **kwargs,
         )
 
