@@ -938,9 +938,9 @@ def stitch_blocks_with_batch_inpainting(
     axis_size = volume_shape[axis + 1]  # +1 because of channel dimension
     n_blocks = len(volumes_pt)
     
-    # Calculate total size along the axis
-    total_axis_size = axis_size * n_blocks - overlap * (n_blocks - 1)
-    
+    # Calculate total size along the axis (gap-filling mode)
+    total_axis_size = axis_size * n_blocks + overlap * (n_blocks - 1)
+        
     # Create output dimensions
     output_shape = list(volume_shape)
     output_shape[axis + 1] = total_axis_size
@@ -960,7 +960,7 @@ def stitch_blocks_with_batch_inpainting(
         elif axis == 2:
             full_volume_pt[:, :, :, current_pos:current_pos + axis_size] = vol
         
-        current_pos += axis_size - overlap
+        current_pos += axis_size + overlap  # Gap-filling mode: add gap between volumes
     
     # Add batch dimension if needed
     if len(full_volume_pt.shape) == 4:
@@ -969,7 +969,9 @@ def stitch_blocks_with_batch_inpainting(
     # Create junction information for batch inpainting
     junction_infos = []
     for i in range(n_blocks - 1):
-        junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
+        # Gap-filling mode: junction center is in the middle of the gap
+        gap_start = (i + 1) * axis_size + i * overlap
+        junction_center = gap_start + overlap // 2
         process_region_size = max(overlap * 3, 16)
         region_start = max(0, junction_center - process_region_size // 2)
         region_end = min(total_axis_size, region_start + process_region_size)
