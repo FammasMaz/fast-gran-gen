@@ -144,11 +144,13 @@ def stitch_volumes_along_axis_with_inpainting(
         step = axis_size + gap_size  # Blocks are separated by gap_size
         total_axis_size = len(volumes) * axis_size + (len(volumes) - 1) * gap_size
         print(f"    Gap-filling mode: gap_size={gap_size}, step={step}, total={total_axis_size}")
+        print(f"    Calculation: {len(volumes)} blocks × {axis_size} + {len(volumes) - 1} gaps × {gap_size} = {total_axis_size}")
     else:
         # Overlapping mode: blocks overlap and seams are inpainted
         step = axis_size - overlap
         total_axis_size = axis_size + (len(volumes) - 1) * step
         print(f"    Overlapping mode: overlap={overlap}, step={step}, total={total_axis_size}")
+        print(f"    Calculation: {axis_size} + {len(volumes) - 1} × {step} = {total_axis_size}")
 
     print(f"    Axis {axis}: size={axis_size}, step={step}, total={total_axis_size}")
 
@@ -512,6 +514,19 @@ def create_railway_track_3d(
     total_layers = len(height_layer_keys)
     
     print(f"  Processing {total_layers} height layers in batches of {layer_batch_size}")
+    print(f"  Expected height layers: {list(range(grids_height))}")
+    print(f"  Actual height layer keys: {height_layer_keys}")
+    
+    # Debug: Check if any height layers are missing
+    expected_keys = set(range(grids_height))
+    actual_keys = set(height_layer_keys)
+    missing_keys = expected_keys - actual_keys
+    if missing_keys:
+        print(f"  ⚠️  WARNING: Missing height layers: {sorted(missing_keys)}")
+    
+    # Debug: Check layer sizes
+    for k in height_layer_keys:
+        print(f"  Height layer {k}: {len(height_layers[k])} strips")
     
     for batch_start in range(0, total_layers, layer_batch_size):
         batch_end = min(batch_start + layer_batch_size, total_layers)
@@ -550,10 +565,21 @@ def create_railway_track_3d(
 
     # Step 3: Stitch layers along height dimension (W axis)
     print("Step 3: Stitching layers along height dimension...")
+    print(f"  Number of stitched layers: {len(stitched_layers)}")
+    print(f"  Expected layers: {grids_height}")
+    
+    if len(stitched_layers) != grids_height:
+        print(f"  ⚠️  WARNING: Expected {grids_height} layers but got {len(stitched_layers)}")
+    
+    # Debug: Print layer shapes
+    for i, layer in enumerate(stitched_layers):
+        print(f"  Layer {i} shape: {layer.shape}")
 
     if len(stitched_layers) == 1:
+        print("  Only one layer - no gap creation needed")
         final_track = stitched_layers[0]
     else:
+        print(f"  Stitching {len(stitched_layers)} layers with gap size {overlap_w}")
         final_track = stitch_volumes_along_axis_with_inpainting(
             volumes=stitched_layers,
             axis=2,  # W axis
