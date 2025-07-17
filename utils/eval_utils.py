@@ -435,9 +435,11 @@ def batch_inpaint_junctions(
     inpaint_iterations=3,
     inpaint_region_size_ratio=0.3,
     axis=0,  # New parameter: axis along which to inpaint
+    max_batch_size=None,  # New parameter: maximum batch size to avoid OOM
 ):
     """
     Batch process multiple junctions for inpainting to leverage GPU parallelization.
+    Now includes automatic batch chunking to avoid CUDA OOM errors.
     
     Args:
         full_volume_pt: The full volume tensor on GPU
@@ -452,6 +454,8 @@ def batch_inpaint_junctions(
         inpaint_iteratively: Whether to use iterative inpainting
         inpaint_iterations: Number of iterations for iterative inpainting
         inpaint_region_size_ratio: Size ratio for inpainting region
+        axis: Axis along which to inpaint
+        max_batch_size: Maximum batch size to avoid OOM (auto-detect if None)
     
     Returns:
         Updated full_volume_pt with inpainted junctions
@@ -459,6 +463,57 @@ def batch_inpaint_junctions(
     if not junction_infos:
         return full_volume_pt
     
+    # Auto-detect max batch size based on available GPU memory if not specified
+    if max_batch_size is None:
+        # Conservative estimate: start with a reasonable batch size
+        # Can be adjusted based on GPU memory and volume size
+        total_junctions = len(junction_infos)
+        if total_junctions <= 10:
+            max_batch_size = total_junctions
+        elif total_junctions <= 50:
+            max_batch_size = 20
+        elif total_junctions <= 100:
+            max_batch_size = 15
+        else:
+            max_batch_size = 10  # Conservative for very large batches
+    
+    # Split junctions into chunks if needed
+    if len(junction_infos) > max_batch_size:
+        logger.info(f"Splitting {len(junction_infos)} junctions into chunks of {max_batch_size} to avoid OOM")
+        
+        # Process junctions in chunks
+        for chunk_start in range(0, len(junction_infos), max_batch_size):
+            chunk_end = min(chunk_start + max_batch_size, len(junction_infos))
+            chunk_infos = junction_infos[chunk_start:chunk_end]
+            chunk_seed = seed + chunk_start  # Different seed for each chunk
+            
+            logger.info(f"Processing junction chunk {chunk_start//max_batch_size + 1}/{(len(junction_infos) + max_batch_size - 1)//max_batch_size}: "
+                       f"junctions {chunk_start}-{chunk_end-1} ({len(chunk_infos)} junctions)")
+            
+            # Recursively call with smaller batch
+            full_volume_pt = batch_inpaint_junctions(
+                full_volume_pt=full_volume_pt,
+                junction_infos=chunk_infos,
+                inpainting_pipeline=inpainting_pipeline,
+                num_inference_steps=num_inference_steps,
+                device=device,
+                args=args,
+                seed=chunk_seed,
+                use_gap_filling=use_gap_filling,
+                output_dir=output_dir,
+                inpaint_iteratively=inpaint_iteratively,
+                inpaint_iterations=inpaint_iterations,
+                inpaint_region_size_ratio=inpaint_region_size_ratio,
+                axis=axis,
+                max_batch_size=max_batch_size,  # Maintain the same batch size
+            )
+            
+            # Clear cache between chunks
+            torch.cuda.empty_cache()
+        
+        return full_volume_pt
+    
+    # Original batch processing logic (for batches <= max_batch_size)
     inpainting_unet = inpainting_pipeline.unet
     inpainting_scheduler = inpainting_pipeline.scheduler
     inpainting_scheduler.set_timesteps(num_inference_steps)
@@ -870,6 +925,7 @@ def generate_stitched_volume_with_inpainting(
             inpaint_iteratively=False,  # Not implemented for batch yet
             inpaint_iterations=inpaint_iterations,
             inpaint_region_size_ratio=inpaint_region_size_ratio,
+            max_batch_size=20,  # Conservative batch size to avoid OOM
         )
     
     logger.info("Batch inpainting completed.")
@@ -1008,6 +1064,7 @@ def stitch_blocks_with_batch_inpainting(
             inpaint_iterations=3,
             inpaint_region_size_ratio=0.3,
             axis=axis,  # Pass the axis parameter
+            max_batch_size=20,  # Conservative batch size to avoid OOM
         )
     
     # Convert back to numpy

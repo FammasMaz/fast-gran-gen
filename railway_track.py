@@ -121,6 +121,7 @@ def stitch_volumes_along_axis_with_inpainting(
     inference_steps,
     seed,
     mask_type="gap_filling_compatible",
+    inpaint_batch_size=20,
     **kwargs,
 ):
     """
@@ -265,6 +266,7 @@ def stitch_volumes_along_axis_with_inpainting(
             inpaint_iterations=3,
             inpaint_region_size_ratio=0.3,
             axis=axis,  # Pass the axis parameter
+            max_batch_size=inpaint_batch_size,  # Use configurable batch size
         )
     
     # Convert back to numpy
@@ -477,6 +479,7 @@ def stitch_multiple_layers_with_cross_layer_batching(
                     inpaint_iterations=3,
                     inpaint_region_size_ratio=0.3,
                     axis=axis,
+                    max_batch_size=max_batch_size,  # Use configurable batch size
                 )
                 
                 processed_layers += 1
@@ -671,6 +674,7 @@ def create_railway_track_3d(
     binary=False,
     debug=False,
     strip_batch_size=4,
+    inpaint_batch_size=20,
     layer_batch_size=4,  # New parameter for height layer batching
     **kwargs,
 ):
@@ -751,7 +755,7 @@ def create_railway_track_3d(
         inference_steps=inference_steps,
         seed=seed,
         mask_type=mask_type,
-        max_batch_size=layer_batch_size * 5,  # Allow larger batches across layers
+        max_batch_size=inpaint_batch_size,  # Use configurable batch size
         **kwargs,
     )
 
@@ -770,6 +774,7 @@ def create_railway_track_3d(
             inference_steps=inference_steps,
             seed=seed + 100000,
             mask_type=mask_type,
+            inpaint_batch_size=inpaint_batch_size,
             **kwargs,
         )
 
@@ -793,6 +798,7 @@ def create_railway_track(
     scheduler_type="ddim",
     debug=False,
     strip_batch_size=4,
+    inpaint_batch_size=20,
     **kwargs,
 ):
     """
@@ -859,6 +865,7 @@ def create_railway_track(
             overlap_w=overlap_l,
             debug=debug,
             strip_batch_size=strip_batch_size,
+            inpaint_batch_size=inpaint_batch_size,
             layer_batch_size=4,  # Default layer batch size
             **kwargs,
         )
@@ -932,6 +939,7 @@ def main():
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation")
     parser.add_argument("--strip_batch_size", type=int, default=4, help="Number of strips to process in parallel (default: 4)")
+    parser.add_argument("--inpaint_batch_size", type=int, default=20, help="Maximum batch size for inpainting junctions to avoid OOM (default: 20)")
     parser.add_argument("--binary", action="store_true", help="Threshold output to binary mask (>0.5)")
 
     # Inpainting parameters
@@ -996,6 +1004,7 @@ def main():
         mask_type=args.mask_type,
         batch_size=args.batch_size,
         strip_batch_size=args.strip_batch_size,
+        inpaint_batch_size=args.inpaint_batch_size,
         binary=args.binary,
         inpaint_region_size_ratio=args.inpaint_region_size_ratio,
         inpaint_iteratively=args.inpaint_iteratively,
