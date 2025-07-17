@@ -848,3 +848,126 @@ def generate_stitched_volume_with_inpainting(
 
     logger.info(f"Final stitched volume shape: {final_volume_np.shape}")
     return final_volume_np
+
+
+def stitch_blocks_with_batch_inpainting(
+    volumes,
+    axis,
+    overlap,
+    inpainting_pipeline,
+    device,
+    output_dir,
+    inference_steps,
+    seed,
+    binary=False,
+    debug=False,
+):
+    """
+    Stitch pre-generated blocks using the batch inpainting optimization.
+    
+    Args:
+        volumes: List of volumes to stitch
+        axis: Axis along which to stitch (0, 1, or 2)
+        overlap: Overlap size between volumes
+        inpainting_pipeline: Inpainting pipeline for seam fixing
+        device: Device to use for computation
+        output_dir: Output directory for debug files
+        inference_steps: Number of inference steps for inpainting
+        seed: Random seed
+        binary: Whether to apply binary thresholding
+        debug: Whether to save debug information
+        
+    Returns:
+        Stitched volume as numpy array
+    """
+    if not volumes:
+        return None
+        
+    # Convert volumes to pytorch tensors if needed
+    volumes_pt = []
+    for vol in volumes:
+        if isinstance(vol, np.ndarray):
+            vol_pt = numpy_to_pt(vol)
+        else:
+            vol_pt = vol
+        volumes_pt.append(vol_pt)
+    
+    # Calculate output dimensions
+    volume_shape = volumes_pt[0].shape
+    axis_size = volume_shape[axis + 1]  # +1 because of channel dimension
+    n_blocks = len(volumes_pt)
+    
+    # Calculate total size along the axis
+    total_axis_size = axis_size * n_blocks - overlap * (n_blocks - 1)
+    
+    # Create output dimensions
+    output_shape = list(volume_shape)
+    output_shape[axis + 1] = total_axis_size
+    
+    # Create full volume tensor
+    full_volume_pt = torch.zeros(output_shape, device=device)
+    
+    # Place volumes into the full volume
+    current_pos = 0
+    for i, vol in enumerate(volumes_pt):
+        vol = vol.to(device)
+        
+        if axis == 0:
+            full_volume_pt[:, current_pos:current_pos + axis_size, :, :] = vol
+        elif axis == 1:
+            full_volume_pt[:, :, current_pos:current_pos + axis_size, :] = vol
+        elif axis == 2:
+            full_volume_pt[:, :, :, current_pos:current_pos + axis_size] = vol
+        
+        current_pos += axis_size - overlap
+    
+    # Add batch dimension if needed
+    if len(full_volume_pt.shape) == 4:
+        full_volume_pt = full_volume_pt.unsqueeze(0)
+    
+    # Create junction information for batch inpainting
+    junction_infos = []
+    for i in range(n_blocks - 1):
+        junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
+        junction_infos.append({
+            'axis': axis,
+            'center': junction_center,
+            'overlap': overlap,
+            'process_region_size': max(overlap * 3, 16),
+        })
+    
+    # Use batch inpainting if pipeline is available
+    if inpainting_pipeline is not None and len(junction_infos) > 0:
+        logger.info(f"Performing batch inpainting for {len(junction_infos)} junctions")
+        
+        # Create dummy args for batch inpainting
+        dummy_args = argparse.Namespace(
+            mask_type="gap_filling_compatible",
+        )
+        
+        batch_inpaint_junctions(
+            full_volume_pt=full_volume_pt,
+            junction_infos=junction_infos,
+            inpainting_pipeline=inpainting_pipeline,
+            num_inference_steps=inference_steps,
+            device=device,
+            args=dummy_args,
+            seed=seed,
+            use_gap_filling=False,
+            output_dir=output_dir,
+            inpaint_iteratively=False,
+            inpaint_iterations=3,
+            inpaint_region_size_ratio=0.3,
+        )
+    
+    # Convert back to numpy
+    final_volume_np = pt_to_numpy(full_volume_pt.squeeze(0))
+    
+    if final_volume_np.shape[0] == 1:
+        final_volume_np = final_volume_np.squeeze(0)
+    
+    if binary:
+        final_volume_np = (final_volume_np > 0.5).astype(np.float32)
+    
+    logger.info(f"Final stitched volume shape: {final_volume_np.shape}")
+    return final_volume_np

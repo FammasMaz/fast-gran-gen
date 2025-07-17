@@ -445,6 +445,155 @@ def stitch_volumes_along_axis_with_inpainting(
     return result_np
 
 
+def create_strips_in_batches(
+    unet,
+    scheduler,
+    inpainting_pipeline,
+    device,
+    output_dir,
+    strip_positions,
+    grids_length,
+    overlap_d,
+    inference_steps,
+    seed,
+    stitching_mode,
+    mask_type,
+    batch_size,
+    binary,
+    debug,
+    strip_batch_size=4,
+    **kwargs,
+):
+    """
+    Create multiple strips in batches to leverage parallelization.
+    
+    Args:
+        strip_positions: List of (j, k) positions for strips to create
+        strip_batch_size: Number of strips to process in parallel
+        Other args: Same as create_railway_track_1d
+    
+    Returns:
+        List of strip dictionaries with volume and position
+    """
+    strips = []
+    total_strips = len(strip_positions)
+    
+    print(f"Creating {total_strips} strips in batches of {strip_batch_size}")
+    
+    # Process strips in batches
+    for batch_start in range(0, total_strips, strip_batch_size):
+        batch_end = min(batch_start + strip_batch_size, total_strips)
+        batch_positions = strip_positions[batch_start:batch_end]
+        current_batch_size = len(batch_positions)
+        
+        print(f"  Processing strip batch {batch_start//strip_batch_size + 1}/{(total_strips + strip_batch_size - 1)//strip_batch_size} "
+              f"({current_batch_size} strips)")
+        
+        # Generate all blocks for this batch of strips simultaneously
+        batch_strips = []
+        
+        # Calculate total blocks needed for this batch
+        total_blocks_needed = current_batch_size * grids_length
+        
+        # Generate all blocks for all strips in this batch at once
+        print(f"    Generating {total_blocks_needed} blocks for {current_batch_size} strips in parallel...")
+        
+        # Create a large batch with all blocks for all strips
+        all_blocks = []
+        all_block_seeds = []
+        
+        for idx, (j, k) in enumerate(batch_positions):
+            strip_seed = seed + j * 1000 + k * 100
+            
+            # Generate seeds for each block in this strip
+            for block_idx in range(grids_length):
+                block_seed = strip_seed + block_idx
+                all_block_seeds.append(block_seed)
+        
+        # Generate all blocks in large batches
+        from utils.eval_utils import generate_single_volume
+        import argparse
+        
+        # Create temporary args for block generation
+        temp_args = argparse.Namespace(
+            mask_type="none",  # Ensure unconditional generation for initial blocks
+            **{k: v for k, v in kwargs.items() if k != 'mask_type'}
+        )
+        
+        # Generate blocks in batches
+        effective_batch_size = min(batch_size * 2, total_blocks_needed)  # Use larger batch size
+        
+        for block_batch_start in range(0, total_blocks_needed, effective_batch_size):
+            block_batch_end = min(block_batch_start + effective_batch_size, total_blocks_needed)
+            current_block_batch_size = block_batch_end - block_batch_start
+            
+            # Use the first seed for this batch (we'll handle randomness differently)
+            batch_seed = all_block_seeds[block_batch_start]
+            
+            blocks_batch = generate_single_volume(
+                unet=unet,
+                scheduler=scheduler,
+                num_steps=inference_steps,
+                seed=batch_seed,
+                batch_size=current_block_batch_size,
+                device=device,
+                args=temp_args,
+                min_bw_ratio=0.0,
+                max_retries=0,
+                progress_callback=None,
+            )
+            
+            if blocks_batch:
+                all_blocks.extend(blocks_batch)
+        
+        print(f"    Generated {len(all_blocks)} blocks total")
+        
+        # Now organize blocks into strips and perform inpainting for each strip
+        block_idx = 0
+        for idx, (j, k) in enumerate(batch_positions):
+            strip_seed = seed + j * 1000 + k * 100
+            
+            print(f"    Creating strip {batch_start + idx + 1}/{total_strips} for position (width={j}, height={k}) with seed={strip_seed}")
+            
+            # Get blocks for this strip
+            strip_blocks = all_blocks[block_idx:block_idx + grids_length]
+            block_idx += grids_length
+            
+            if len(strip_blocks) == grids_length:
+                # Create a single volume from pre-generated blocks
+                # Use the optimized stitching function that supports batch inpainting
+                from utils.eval_utils import stitch_blocks_with_batch_inpainting
+                
+                strip = stitch_blocks_with_batch_inpainting(
+                    volumes=strip_blocks,
+                    axis=0,  # Length axis
+                    overlap=overlap_d,
+                    inpainting_pipeline=inpainting_pipeline,
+                    device=device,
+                    output_dir=output_dir / f"strip_{j}_{k}" if debug else output_dir,
+                    inference_steps=inference_steps,
+                    seed=strip_seed,
+                    binary=binary,
+                    debug=debug,
+                )
+                
+                if strip is not None:
+                    batch_strips.append({
+                        "volume": strip,
+                        "position": (j, k),  # width, height position
+                    })
+                    print(f"      ✓ Strip completed. Shape: {strip.shape}")
+                else:
+                    print(f"      ✗ Warning: Failed to create strip at position ({j}, {k})")
+            else:
+                print(f"      ✗ Warning: Not enough blocks generated for strip at position ({j}, {k})")
+        
+        strips.extend(batch_strips)
+        print(f"    Batch completed. {len(batch_strips)} strips created successfully.")
+    
+    return strips
+
+
 def create_railway_track_3d(
     unet,
     scheduler,
@@ -464,59 +613,50 @@ def create_railway_track_3d(
     batch_size=1,
     binary=False,
     debug=False,
+    strip_batch_size=4,
     **kwargs,
 ):
     """
     Create a 3D railway track by extending in multiple dimensions using pre-loaded models.
 
     Strategy:
-    1. First create strips along length dimension (using 1D approach)
+    1. First create strips along length dimension (using batched approach)
     2. Then stitch strips along width dimension
     3. Finally stitch layers along height dimension
     """
     print(f"Creating 3D railway track: {grids_length}x{grids_width}x{grids_height} grids")
     print(f"Overlaps: D={overlap_d}, H={overlap_h}, W={overlap_w}")
+    print(f"Strip batch size: {strip_batch_size}")
 
-    # Step 1: Create strips along length dimension (D axis)
-    print("Step 1: Creating length strips...")
-    strips = []
-
+    # Step 1: Create strips along length dimension (D axis) using batched approach
+    print("Step 1: Creating length strips in batches...")
+    
+    # Generate all strip positions
+    strip_positions = []
     for j in range(grids_width):
         for k in range(grids_height):
-            strip_seed = seed + j * 1000 + k * 100
-            print(
-                f"  Creating strip {len(strips) + 1}/{grids_width * grids_height} for position (width={j}, height={k}) with seed={strip_seed}"
-            )
-
-            # Create 1D track along length using pre-loaded models
-            strip = create_railway_track_1d(
-                unet=unet,
-                scheduler=scheduler,
-                inpainting_pipeline=inpainting_pipeline,
-                device=device,
-                output_dir=output_dir / f"strip_{j}_{k}" if debug else output_dir,
-                n_blocks_length=grids_length,
-                overlap=overlap_d,
-                inference_steps=inference_steps,
-                seed=strip_seed,
-                stitching_mode=stitching_mode,
-                mask_type=mask_type,
-                batch_size=batch_size,
-                binary=binary,
-                debug=debug,
-                **kwargs,
-            )
-
-            if strip is not None:
-                strips.append(
-                    {
-                        "volume": strip,
-                        "position": (j, k),  # width, height position
-                    }
-                )
-                print(f"    ✓ Strip completed. Shape: {strip.shape}")
-            else:
-                print(f"    ✗ Warning: Failed to create strip at position ({j}, {k})")
+            strip_positions.append((j, k))
+    
+    # Create strips in batches
+    strips = create_strips_in_batches(
+        unet=unet,
+        scheduler=scheduler,
+        inpainting_pipeline=inpainting_pipeline,
+        device=device,
+        output_dir=output_dir,
+        strip_positions=strip_positions,
+        grids_length=grids_length,
+        overlap_d=overlap_d,
+        inference_steps=inference_steps,
+        seed=seed,
+        stitching_mode=stitching_mode,
+        mask_type=mask_type,
+        batch_size=batch_size,
+        binary=binary,
+        debug=debug,
+        strip_batch_size=strip_batch_size,
+        **kwargs,
+    )
 
     if not strips:
         print("Error: No strips were created successfully.")
@@ -597,6 +737,7 @@ def create_railway_track(
     overlap_l=8,
     scheduler_type="ddim",
     debug=False,
+    strip_batch_size=4,
     **kwargs,
 ):
     """
@@ -662,6 +803,7 @@ def create_railway_track(
             overlap_h=overlap_w,
             overlap_w=overlap_l,
             debug=debug,
+            strip_batch_size=strip_batch_size,
             **kwargs,
         )
 
@@ -733,6 +875,7 @@ def main():
         help="Type of mask to use for inpainting mode",
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation")
+    parser.add_argument("--strip_batch_size", type=int, default=4, help="Number of strips to process in parallel (default: 4)")
     parser.add_argument("--binary", action="store_true", help="Threshold output to binary mask (>0.5)")
 
     # Inpainting parameters
@@ -796,6 +939,7 @@ def main():
         stitching_mode=args.stitching_mode,
         mask_type=args.mask_type,
         batch_size=args.batch_size,
+        strip_batch_size=args.strip_batch_size,
         binary=args.binary,
         inpaint_region_size_ratio=args.inpaint_region_size_ratio,
         inpaint_iteratively=args.inpaint_iteratively,
