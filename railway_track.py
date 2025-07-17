@@ -125,6 +125,7 @@ def stitch_volumes_along_axis_with_inpainting(
 ):
     """
     Stitch multiple volumes along a specified axis using gap-filling or overlapping logic.
+    Now uses batch inpainting optimization for improved performance.
     """
     if len(volumes) == 1:
         return volumes[0]
@@ -198,252 +199,79 @@ def stitch_volumes_along_axis_with_inpainting(
 
     full_volume_pt = full_volume_pt.to(device)
 
-    # Now perform inpainting at junction regions
+    # Now perform inpainting at junction regions using batch optimization
     if inpainting_pipeline is not None:
-        print(f"    Performing inpainting at {len(volumes) - 1} junctions...")
+        print(f"    Performing batch inpainting at {len(volumes) - 1} junctions...")
 
-        inpainting_unet = inpainting_pipeline.unet
-        inpainting_scheduler = inpainting_pipeline.scheduler
-        inpainting_scheduler.set_timesteps(inference_steps)
-        inpainting_unet.eval()
-
-        if mask_type == "gap_filling_compatible":
-            # Gap-filling mode: inpaint the gaps between blocks
-            gap_size = overlap  # In gap mode, overlap parameter is gap size
-            for i in range(len(volumes) - 1):
-                # Gap center is in the middle of the gap between blocks
+        # Use the optimized batch inpainting function
+        from utils.eval_utils import batch_inpaint_junctions
+        import argparse
+        
+        # Create junction information for batch inpainting
+        junction_infos = []
+        for i in range(len(volumes) - 1):
+            if mask_type == "gap_filling_compatible":
+                # Gap-filling mode: inpaint the gaps between blocks
+                gap_size = overlap  # In gap mode, overlap parameter is gap size
                 gap_start = (i + 1) * axis_size + i * gap_size  # End of previous block + previous gaps
                 gap_center = gap_start + gap_size // 2
-
+                
                 # Define processing region around gap
                 process_region_size = max(gap_size * 3, 16)  # Ensure sufficient context
                 region_start = max(0, gap_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-
-                print(
-                    f"      Inpainting gap {i + 1}: gap_start={gap_start}, gap_center={gap_center}, region={region_start}:{region_end}"
-                )
-
-                # Extract region for inpainting
-                if axis == 0:
-                    image_slice = full_volume_pt[0, :, region_start:region_end, :, :].clone()
-                elif axis == 1:
-                    image_slice = full_volume_pt[0, :, :, region_start:region_end, :].clone()
-                elif axis == 2:
-                    image_slice = full_volume_pt[0, :, :, :, region_start:region_end].clone()
-
-                # Create mask for gap region
-                region_depth = region_end - region_start
-                gap_local_start = gap_start - region_start
-                gap_local_end = gap_local_start + gap_size
-                gap_local_start = max(0, gap_local_start)
-                gap_local_end = min(region_depth, gap_local_end)
-
-                mask = torch.zeros_like(image_slice)
-                if axis == 0:
-                    mask[:, gap_local_start:gap_local_end, :, :] = 1.0
-                elif axis == 1:
-                    mask[:, :, gap_local_start:gap_local_end, :] = 1.0
-                elif axis == 2:
-                    mask[:, :, :, gap_local_start:gap_local_end] = 1.0
-
-                # Perform proper diffusion inpainting
-                mask_b = mask.unsqueeze(0).to(device)
-                image_slice_b = image_slice.unsqueeze(0).to(device)
-
-                # Create mask for UNet input (single channel)
-                mask_unet_input_b = mask[0:1, ...].repeat(1, 1, 1, 1, 1).to(device)  # (B=1, C=1, D, H, W)
-
-                # Generate seed for this gap
-                gap_seed = seed + i * 1000 + 42
-                generator = torch.Generator(device=device).manual_seed(gap_seed)
-
-                try:
-                    # Set up the diffusion process
-                    inpainting_scheduler.set_timesteps(inference_steps)
-                    timesteps = inpainting_scheduler.timesteps
-
-                    # Create initial noise for the entire region
-                    latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
-
-                    # Create masked images (original * (1 - mask) - mask)
-                    masked_images = image_slice_b * (1.0 - mask_b) - mask_b
-
-                    # Scale initial noise if needed
-                    if hasattr(inpainting_scheduler, "init_noise_sigma"):
-                        latents = latents * inpainting_scheduler.init_noise_sigma
-
-                    with torch.no_grad():
-                        for i_step, t in enumerate(timesteps):
-                            t_input = t.repeat(image_slice_b.shape[0])  # Batch size
-
-                            # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
-                            unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
-
-                            # Predict noise
-                            noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
-
-                            # Scheduler step
-                            step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
-                            x_prev_denoised_candidate = step_output.prev_sample
-
-                            # RePaint-like guidance: ensure known regions stay consistent
-                            if i_step < len(timesteps) - 1:
-                                # Add noise to the original image for the next timestep
-                                prev_t = timesteps[i_step + 1]
-                                noise_for_gt_conditioning = torch.randn(
-                                    image_slice_b.shape, device=device, dtype=image_slice_b.dtype
-                                )
-
-                                # Add noise to original image
-                                x_prev_noised_known_gt = inpainting_scheduler.add_noise(
-                                    image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
-                                )
-
-                                # Composite: use inpainted prediction for masked areas, noisy GT for known areas
-                                latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
-                            else:
-                                # Last step: composite final x0 prediction
-                                latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
-
-                    # Update with inpainted result
-                    image_slice_b = latents
-
-                except Exception as e:
-                    print(f"      Warning: Inpainting failed for gap {i + 1}: {e}")
-                    # Fallback to simple blending
-                    masked_region = mask_b > 0.5
-                    if masked_region.any():
-                        # Simple blending as fallback
-                        image_slice_b[masked_region] = image_slice_b[masked_region] * 0.5
-
-                # Put inpainted region back
-                if axis == 0:
-                    full_volume_pt[0, :, region_start:region_end, :, :] = image_slice_b[0]
-                elif axis == 1:
-                    full_volume_pt[0, :, :, region_start:region_end, :] = image_slice_b[0]
-                elif axis == 2:
-                    full_volume_pt[0, :, :, :, region_start:region_end] = image_slice_b[0]
-        else:
-            # Overlapping mode: inpaint the seam regions
-            current_pos = step
-            for i in range(len(volumes) - 1):
-                junction_center = current_pos
-
-                # Define processing region around junction
-                process_region_size = max(axis_size, overlap * 3)
+                
+                junction_infos.append({
+                    'junction_idx': i,
+                    'region_start_d': region_start,
+                    'region_end_d': region_end,
+                    'junction_center_d': gap_center,
+                    'region_depth': region_end - region_start,
+                    'gap_size': gap_size,
+                })
+            else:
+                # Overlapping mode: inpaint the overlapping regions
+                junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
+                process_region_size = max(overlap * 3, 16)
                 region_start = max(0, junction_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-
-                # Extract region for inpainting
-                if axis == 0:
-                    image_slice = full_volume_pt[0, :, region_start:region_end, :, :].clone()
-                elif axis == 1:
-                    image_slice = full_volume_pt[0, :, :, region_start:region_end, :].clone()
-                elif axis == 2:
-                    image_slice = full_volume_pt[0, :, :, :, region_start:region_end].clone()
-
-                # Create mask for junction region
-                region_depth = region_end - region_start
-                junction_local_center = junction_center - region_start
-                mask_width = overlap
-                mask_start = max(0, junction_local_center - mask_width // 2)
-                mask_end = min(region_depth, mask_start + mask_width)
-
-                mask = torch.zeros_like(image_slice)
-                if axis == 0:
-                    mask[:, mask_start:mask_end, :, :] = 1.0
-                elif axis == 1:
-                    mask[:, :, mask_start:mask_end, :] = 1.0
-                elif axis == 2:
-                    mask[:, :, :, mask_start:mask_end] = 1.0
-
-                # Perform proper diffusion inpainting for overlap regions
-                mask_b = mask.unsqueeze(0).to(device)
-                image_slice_b = image_slice.unsqueeze(0).to(device)
-
-                # Create mask for UNet input (single channel)
-                mask_unet_input_b = mask[0:1, ...].repeat(1, 1, 1, 1, 1).to(device)  # (B=1, C=1, D, H, W)
-
-                # Generate seed for this junction
-                junction_seed = seed + i * 1000 + current_pos
-                generator = torch.Generator(device=device).manual_seed(junction_seed)
-
-                try:
-                    # Set up the diffusion process
-                    inpainting_scheduler.set_timesteps(inference_steps)
-                    timesteps = inpainting_scheduler.timesteps
-
-                    # Create initial noise for the entire region
-                    latents = torch.randn(image_slice_b.shape, generator=generator, device=device)
-
-                    # Create masked images (original * (1 - mask) - mask)
-                    masked_images = image_slice_b * (1.0 - mask_b) - mask_b
-
-                    # Scale initial noise if needed
-                    if hasattr(inpainting_scheduler, "init_noise_sigma"):
-                        latents = latents * inpainting_scheduler.init_noise_sigma
-
-                    with torch.no_grad():
-                        for i_step, t in enumerate(timesteps):
-                            t_input = t.repeat(image_slice_b.shape[0])  # Batch size
-
-                            # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
-                            unet_input = torch.cat([latents, mask_unet_input_b, masked_images], dim=1)
-
-                            # Predict noise
-                            noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
-
-                            # Scheduler step
-                            step_output = inpainting_scheduler.step(noise_pred, t, latents, generator=generator)
-                            x_prev_denoised_candidate = step_output.prev_sample
-
-                            # RePaint-like guidance: ensure known regions stay consistent
-                            if i_step < len(timesteps) - 1:
-                                # Add noise to the original image for the next timestep
-                                prev_t = timesteps[i_step + 1]
-                                noise_for_gt_conditioning = torch.randn(
-                                    image_slice_b.shape, device=device, dtype=image_slice_b.dtype
-                                )
-
-                                # Add noise to original image
-                                x_prev_noised_known_gt = inpainting_scheduler.add_noise(
-                                    image_slice_b, noise_for_gt_conditioning, prev_t.unsqueeze(0)
-                                )
-
-                                # Composite: use inpainted prediction for masked areas, noisy GT for known areas
-                                latents = x_prev_denoised_candidate * mask_b + x_prev_noised_known_gt * (1.0 - mask_b)
-                            else:
-                                # Last step: composite final x0 prediction
-                                latents = x_prev_denoised_candidate * mask_b + image_slice_b * (1.0 - mask_b)
-
-                    # Update with inpainted result
-                    image_slice_b = latents
-
-                except Exception as e:
-                    print(f"      Warning: Inpainting failed for junction {i + 1}: {e}")
-                    # Fallback to simple blending
-                    masked_region = mask_b > 0.5
-                    if masked_region.any():
-                        image_slice_b[masked_region] *= 0.7  # Reduce intensity in junction
-
-                # Put inpainted region back
-                if axis == 0:
-                    full_volume_pt[0, :, region_start:region_end, :, :] = image_slice_b[0]
-                elif axis == 1:
-                    full_volume_pt[0, :, :, region_start:region_end, :] = image_slice_b[0]
-                elif axis == 2:
-                    full_volume_pt[0, :, :, :, region_start:region_end] = image_slice_b[0]
-
-                current_pos += step
-
+                
+                junction_infos.append({
+                    'junction_idx': i,
+                    'region_start_d': region_start,
+                    'region_end_d': region_end,
+                    'junction_center_d': junction_center,
+                    'region_depth': region_end - region_start,
+                    'gap_size': 0,  # No gap in overlapping mode
+                })
+        
+        # Create dummy args for batch inpainting
+        dummy_args = argparse.Namespace(
+            mask_type=mask_type,
+        )
+        
+        # Apply batch inpainting
+        batch_inpaint_junctions(
+            full_volume_pt=full_volume_pt,
+            junction_infos=junction_infos,
+            inpainting_pipeline=inpainting_pipeline,
+            num_inference_steps=inference_steps,
+            device=device,
+            args=dummy_args,
+            seed=seed,
+            use_gap_filling=(mask_type == "gap_filling_compatible"),
+            output_dir=None,
+            inpaint_iteratively=False,
+            inpaint_iterations=3,
+            inpaint_region_size_ratio=0.3,
+        )
+    
     # Convert back to numpy
     result_np = pt_to_numpy(full_volume_pt[0])
     if result_np.shape[0] == 1:  # Remove channel dimension if single channel
         result_np = result_np.squeeze(0)
 
     return result_np
-
 
 def create_strips_in_batches(
     unet,
