@@ -934,11 +934,17 @@ def stitch_blocks_with_batch_inpainting(
     junction_infos = []
     for i in range(n_blocks - 1):
         junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
+        process_region_size = max(overlap * 3, 16)
+        region_start = max(0, junction_center - process_region_size // 2)
+        region_end = min(total_axis_size, region_start + process_region_size)
+        
         junction_infos.append({
-            'axis': axis,
-            'center': junction_center,
-            'overlap': overlap,
-            'process_region_size': max(overlap * 3, 16),
+            'junction_idx': i,
+            'region_start_d': region_start,
+            'region_end_d': region_end,
+            'junction_center_d': junction_center,
+            'region_depth': region_end - region_start,
+            'gap_size': overlap,  # In case gap_filling mode is used
         })
     
     # Use batch inpainting if pipeline is available
