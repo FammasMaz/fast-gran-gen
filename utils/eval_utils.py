@@ -890,6 +890,11 @@ def stitch_blocks_with_batch_inpainting(
             vol_pt = numpy_to_pt(vol)
         else:
             vol_pt = vol
+        
+        # Ensure proper tensor format: add channel dimension if needed
+        if len(vol_pt.shape) == 3:  # (D, H, W) -> (1, D, H, W)
+            vol_pt = vol_pt.unsqueeze(0)
+        
         volumes_pt.append(vol_pt)
     
     # Calculate output dimensions
