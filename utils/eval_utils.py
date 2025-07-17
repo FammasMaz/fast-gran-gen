@@ -526,7 +526,7 @@ def batch_inpaint_junctions(
     # If no valid junctions, return early
     if not batch_image_slices:
         logger.info("No valid junctions found for batch inpainting")
-        return
+        return full_volume_pt
     
     # Stack into batch tensors
     batch_image_slices = torch.stack(batch_image_slices, dim=0)  # (B, C, D, H, W)
@@ -1000,7 +1000,7 @@ def stitch_blocks_with_batch_inpainting(
             device=device,
             args=dummy_args,
             seed=seed,
-            use_gap_filling=False,
+            use_gap_filling=True,  # Should be True for gap_filling_compatible
             output_dir=output_dir,
             inpaint_iteratively=False,
             inpaint_iterations=3,
