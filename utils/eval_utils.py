@@ -434,6 +434,7 @@ def batch_inpaint_junctions(
     inpaint_iteratively=False,
     inpaint_iterations=3,
     inpaint_region_size_ratio=0.3,
+    axis=0,  # New parameter: axis along which to inpaint
 ):
     """
     Batch process multiple junctions for inpainting to leverage GPU parallelization.
@@ -470,19 +471,39 @@ def batch_inpaint_junctions(
     
     logger.info(f"Preparing batch of {len(junction_infos)} junctions for parallel inpainting")
     
+    valid_junction_infos = []
     for i, junction_info in enumerate(junction_infos):
         region_start_d = junction_info['region_start_d']
         region_end_d = junction_info['region_end_d']
         junction_center_d = junction_info['junction_center_d']
         gap_size = junction_info.get('gap_size', 0)
         
-        # Extract junction slice
-        image_slice = full_volume_pt[0, :, region_start_d:region_end_d, :, :].clone()
+        # Check if region is valid
+        region_depth = region_end_d - region_start_d
+        if region_depth <= 0:
+            logger.warning(f"Skipping junction {i} with invalid region depth: {region_depth} (start={region_start_d}, end={region_end_d})")
+            continue
+            
+        # Extract junction slice based on axis
+        if axis == 0:
+            image_slice = full_volume_pt[0, :, region_start_d:region_end_d, :, :].clone()
+        elif axis == 1:
+            image_slice = full_volume_pt[0, :, :, region_start_d:region_end_d, :].clone()
+        elif axis == 2:
+            image_slice = full_volume_pt[0, :, :, :, region_start_d:region_end_d].clone()
+        else:
+            raise ValueError(f"Unsupported axis: {axis}")
+        
+        # Validate slice dimensions
+        if image_slice.numel() == 0:
+            logger.warning(f"Skipping junction {i} with empty slice dimensions: {image_slice.shape}")
+            continue
+            
         batch_image_slices.append(image_slice)
         batch_regions.append((region_start_d, region_end_d))
+        valid_junction_infos.append(junction_info)
         
         # Create mask for this junction
-        region_depth = region_end_d - region_start_d
         junction_local_center = junction_center_d - region_start_d
         
         if use_gap_filling:
@@ -494,8 +515,18 @@ def batch_inpaint_junctions(
         mask_end = min(region_depth, mask_start + mask_width)
         
         mask = torch.zeros_like(image_slice)
-        mask[:, mask_start:mask_end, :, :] = 1.0
+        if axis == 0:
+            mask[:, mask_start:mask_end, :, :] = 1.0
+        elif axis == 1:
+            mask[:, :, mask_start:mask_end, :] = 1.0
+        elif axis == 2:
+            mask[:, :, :, mask_start:mask_end] = 1.0
         batch_masks.append(mask)
+    
+    # If no valid junctions, return early
+    if not batch_image_slices:
+        logger.info("No valid junctions found for batch inpainting")
+        return
     
     # Stack into batch tensors
     batch_image_slices = torch.stack(batch_image_slices, dim=0)  # (B, C, D, H, W)
@@ -562,17 +593,22 @@ def batch_inpaint_junctions(
                     # Last step: composite final x0 prediction
                     batch_latents = x_prev_denoised_candidate * batch_masks + batch_image_slices * (1.0 - batch_masks)
         
-        # Place results back into full volume
+        # Place results back into full volume based on axis
         for i, (region_start_d, region_end_d) in enumerate(batch_regions):
-            full_volume_pt[0, :, region_start_d:region_end_d, :, :] = batch_latents[i]
+            if axis == 0:
+                full_volume_pt[0, :, region_start_d:region_end_d, :, :] = batch_latents[i]
+            elif axis == 1:
+                full_volume_pt[0, :, :, region_start_d:region_end_d, :] = batch_latents[i]
+            elif axis == 2:
+                full_volume_pt[0, :, :, :, region_start_d:region_end_d] = batch_latents[i]
         
-        logger.info(f"Batch inpainting completed for {len(junction_infos)} junctions")
+        logger.info(f"Batch inpainting completed for {len(valid_junction_infos)} valid junctions out of {len(junction_infos)} total")
         
         # Save debug outputs if requested
         if output_dir:
             debug_dir = Path(output_dir) / f"batch_inpainting_debug_seed{seed}"
             debug_dir.mkdir(parents=True, exist_ok=True)
-            for i in range(len(junction_infos)):
+            for i in range(len(valid_junction_infos)):
                 result_np = pt_to_numpy(batch_latents[i])
                 np.save(debug_dir / f"batch_junction_{i:02d}.npy", result_np)
         
@@ -969,6 +1005,7 @@ def stitch_blocks_with_batch_inpainting(
             inpaint_iteratively=False,
             inpaint_iterations=3,
             inpaint_region_size_ratio=0.3,
+            axis=axis,  # Pass the axis parameter
         )
     
     # Convert back to numpy

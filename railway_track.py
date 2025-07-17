@@ -264,6 +264,7 @@ def stitch_volumes_along_axis_with_inpainting(
             inpaint_iteratively=False,
             inpaint_iterations=3,
             inpaint_region_size_ratio=0.3,
+            axis=axis,  # Pass the axis parameter
         )
     
     # Convert back to numpy
