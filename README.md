@@ -155,23 +155,23 @@ For fast polyhedron segmentation of generated granular media:
 python polyhedron_segmentation.py \
 --input /path/to/generated/file.vti \
 --output /path/to/output/segmentation.json \
---no-paraview-multiblock 
---decimation-ratio 0.99 
---smoothing-iterations 40 
---erosion-iterations 0 --min-polyhedron-size 100 
---remove-boundary-polyhedrons 
---max-voxel-aspect-ratio 0 
---fast-mesh-extraction 
---stream-batch-size 0 
---num-workers 20 
---batch-mesh-size 0 
---force-cpu 
---num-export-workers 20 
---export-batch-size 400 
---fast-paraview-export 
---ultra-fast-mode 
---max-chunk-workers 20 
---target-vertices 10 
+--no-paraview-multiblock
+--decimation-ratio 0.99
+--smoothing-iterations 40
+--erosion-iterations 0 --min-polyhedron-size 100
+--remove-boundary-polyhedrons
+--max-voxel-aspect-ratio 0
+--fast-mesh-extraction
+--stream-batch-size 0
+--num-workers 20
+--batch-mesh-size 0
+--force-cpu
+--num-export-workers 20
+--export-batch-size 400
+--fast-paraview-export
+--ultra-fast-mode
+--max-chunk-workers 20
+--target-vertices 10
 --fix-mesh-for-lmgc90
 ```
 
@@ -195,7 +195,35 @@ python railway_track.py --model_path "/path/to/base/model" \
 --inference_steps 50 \
 --scheduler_type "ddim" \
 --batch_size 16 \
---seed 484
+--seed 484 \
+--strip_batch_size 32 \
+--inpaint_batch_size 5
+```
+
+Best Segmentation Results were achieved with these parameters:
+```bash
+python polyhedron_segmentation.py \
+          --input "path/to/vti/or/json/file" \
+          --output "path/to/vtp/and/json/on/output" \
+          --method watershed_sdf \
+          --marker-threshold-percentile 90 \
+          --min-distance 2 \
+          --erosion-iterations 0 \
+          --sdf-scale 3.0 \
+          --gaussian-sigma 0.3 \
+          --decimation-ratio 0.85 \
+          --smoothing-iterations 8 \
+          --target-vertices 12 \
+          --min-polyhedron-size 40 \
+          --force-cpu \
+          --fast-mesh-extraction \
+          --stream-batch-size 0 \
+          --fast-paraview-export \
+          --ultra-fast-mode \
+          --num-export-workers 6 \
+          --export-batch-size 400 \
+          --max-chunk-workers 6 \
+          --no-paraview-multiblock
 ```
 
 ## Additional Tools
@@ -212,4 +240,3 @@ python railway_track.py --model_path "/path/to/base/model" \
 ## License
 
 [License info will be provided]
-

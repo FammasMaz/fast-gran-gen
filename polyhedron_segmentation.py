@@ -175,15 +175,24 @@ class GPUAcceleratedOperations:
     def __init__(self, gpu_backend: GPUBackend):
         self.gpu = gpu_backend
 
-    def distance_transform_edt(self, binary_array: np.ndarray) -> np.ndarray:
-        """GPU-accelerated distance transform."""
+    def distance_transform_edt(self, binary_array: np.ndarray, sampling: Optional[Tuple[float, float, float]] = None) -> np.ndarray:
+        """GPU-accelerated distance transform with optional physical sampling.
+
+        Args:
+            binary_array: Boolean array (z, y, x)
+            sampling: Physical voxel spacing per axis (z, y, x). If None, uses voxel units.
+        """
         if self.gpu.backend == "cuda":
             try:
                 import cupy as cp
                 from cupyx.scipy import ndimage as cupy_ndimage
 
                 gpu_array = cp.asarray(binary_array)
-                distance = cupy_ndimage.distance_transform_edt(gpu_array)
+                # cupyx supports the SciPy-compatible signature (sampling keyword)
+                if sampling is not None:
+                    distance = cupy_ndimage.distance_transform_edt(gpu_array, sampling=sampling)
+                else:
+                    distance = cupy_ndimage.distance_transform_edt(gpu_array)
                 return cp.asnumpy(distance)
             except Exception as e:
                 print(f"CUDA distance transform failed, falling back to CPU: {e}")
@@ -203,6 +212,8 @@ class GPUAcceleratedOperations:
                 print(f"MPS distance transform failed, falling back to CPU: {e}")
 
         # CPU fallback
+        if sampling is not None:
+            return ndimage.distance_transform_edt(binary_array, sampling=sampling)
         return ndimage.distance_transform_edt(binary_array)
 
     def _mps_distance_transform(self, binary_tensor):
@@ -240,8 +251,8 @@ class GPUAcceleratedOperations:
 
         return distance
 
-    def gaussian_filter(self, array: np.ndarray, sigma: float) -> np.ndarray:
-        """GPU-accelerated Gaussian filtering."""
+    def gaussian_filter(self, array: np.ndarray, sigma: Union[float, Tuple[float, float, float]]) -> np.ndarray:
+        """GPU-accelerated Gaussian filtering (supports anisotropic sigma)."""
         if self.gpu.backend == "cuda":
             try:
                 import cupy as cp
@@ -649,14 +660,17 @@ class PolyhedronSegmentation:
 
             if use_gpu:
                 print(f"Computing SDF using {self.gpu_backend_name.upper()} acceleration...")
+                # Note: sampling expects (z, y, x)
+                sampling = tuple(self.voxel_spacing[::-1].tolist())
                 # Distance from background (outside)
-                distance_outside = _gpu_ops.distance_transform_edt(binary_voxel == 0)
+                distance_outside = _gpu_ops.distance_transform_edt(binary_voxel == 0, sampling=sampling)
                 # Distance from foreground (inside)
-                distance_inside = _gpu_ops.distance_transform_edt(binary_voxel == 1)
+                distance_inside = _gpu_ops.distance_transform_edt(binary_voxel == 1, sampling=sampling)
             else:
                 # CPU fallback
-                distance_outside = ndimage.distance_transform_edt(binary_voxel == 0)
-                distance_inside = ndimage.distance_transform_edt(binary_voxel == 1)
+                sampling = tuple(self.voxel_spacing[::-1].tolist())
+                distance_outside = ndimage.distance_transform_edt(binary_voxel == 0, sampling=sampling)
+                distance_inside = ndimage.distance_transform_edt(binary_voxel == 1, sampling=sampling)
 
         # Create signed distance field: positive inside, negative outside
         sdf = distance_inside - distance_outside
@@ -664,6 +678,22 @@ class PolyhedronSegmentation:
         # Apply scaling and clipping for numerical stability
         sdf = np.clip(sdf, -scale, scale) / scale
         return sdf.astype(np.float32)
+
+    def distance_transform_edt(
+        self, binary_array: np.ndarray, sampling: Optional[Tuple[float, float, float]] = None
+    ) -> np.ndarray:
+        """Compute distance transform with optional physical sampling, using GPU if available."""
+        use_gpu = self._should_use_gpu(binary_array.size)
+
+        if use_gpu:
+            try:
+                return _gpu_ops.distance_transform_edt(binary_array, sampling=sampling)
+            except Exception as e:
+                print(f"GPU distance transform failed, falling back to CPU: {e}")
+
+        if sampling is not None:
+            return ndimage.distance_transform_edt(binary_array, sampling=sampling)
+        return ndimage.distance_transform_edt(binary_array)
 
     def compute_sdf_gradient_magnitude(self, sdf: np.ndarray) -> np.ndarray:
         """
@@ -716,6 +746,13 @@ class PolyhedronSegmentation:
             print(f"VTI grid dimensions: {grid.dimensions}")
             print(f"Active scalars shape: {grid.active_scalars.shape}")
             print(f"Active scalars size: {grid.active_scalars.size}")
+            # Update spacing and origin from file (dx, dy, dz)
+            try:
+                self.voxel_spacing = np.array(grid.spacing, dtype=float)
+                self.origin = np.array(grid.origin, dtype=float)
+                print(f"Detected voxel spacing from VTI: {self.voxel_spacing.tolist()} and origin: {self.origin.tolist()}")
+            except Exception as e:
+                print(f"Warning: could not read spacing/origin from VTI: {e}")
 
             # Handle different VTI formats and orientations
             try:
@@ -787,14 +824,24 @@ class PolyhedronSegmentation:
 
         # Apply Gaussian smoothing if requested
         if gaussian_sigma > 0:
-            print(f"Applying Gaussian smoothing with sigma: {gaussian_sigma}")
+            print(f"Applying Gaussian smoothing with sigma: {gaussian_sigma} (anisotropic if spacing is anisotropic)")
+            # Build per-axis sigma to approximate equal physical smoothing
+            spacing = self.voxel_spacing.astype(float)
+            if np.any(np.abs(spacing - spacing.min()) > 1e-9):
+                # scale sigma per axis so physical blur radius is similar
+                sigma_xyz = gaussian_sigma * (spacing.min() / spacing)
+            else:
+                sigma_xyz = np.array([gaussian_sigma, gaussian_sigma, gaussian_sigma], dtype=float)
+            # scipy expects (z, y, x)
+            sigma_zyx = tuple(sigma_xyz[::-1].tolist())
+
             # Smooth the original values, then re-threshold
             use_gpu = self._should_use_gpu(voxel_grid.size)
             if use_gpu:
                 print(f"Using {self.gpu_backend_name.upper()} acceleration for Gaussian smoothing")
-                smoothed = _gpu_ops.gaussian_filter(voxel_grid.astype(float), sigma=gaussian_sigma)
+                smoothed = _gpu_ops.gaussian_filter(voxel_grid.astype(float), sigma=sigma_zyx)
             else:
-                smoothed = filters.gaussian(voxel_grid.astype(float), sigma=gaussian_sigma)
+                smoothed = filters.gaussian(voxel_grid.astype(float), sigma=sigma_zyx)
             binary_grid = smoothed > binary_threshold
 
         # Remove small objects
@@ -873,70 +920,101 @@ class PolyhedronSegmentation:
         print("Performing SDF-based watershed segmentation...")
 
         # Step 1: Compute SDF for the binary grid
-        print("Computing Signed Distance Field...")
-        sdf = self.compute_sdf(binary_grid, scale=sdf_scale)
+        print("Computing Signed Distance Field and distance transforms...")
 
-        # Step 2: Optionally apply erosion to separate touching objects for marker detection
-        # The original code implied erosion was for the main binary_grid input to watershed,
-        # but here it's used to refine sdf_for_markers.
-        working_grid_for_markers = binary_grid.copy()
-        if erosion_iterations > 0:  # This erosion is for marker generation
+        binary_bool = binary_grid.astype(bool)
+        sampling = tuple(self.voxel_spacing[::-1].tolist())
+
+        # Unsigned distance inside the grains
+        distance_inside = self.distance_transform_edt(binary_bool, sampling=sampling)
+        # Unsigned distance outside (background)
+        distance_outside = self.distance_transform_edt(~binary_bool, sampling=sampling)
+
+        # Signed distance field with positive interior, negative exterior (clipped/scaled)
+        sdf_raw = distance_inside - distance_outside
+        if sdf_scale > 0:
+            sdf = np.clip(sdf_raw, -sdf_scale, sdf_scale) / sdf_scale
+        else:
+            sdf = sdf_raw
+
+        # Step 2: Optionally apply erosion to refine marker detection
+        if erosion_iterations > 0:
             print(f"Applying binary erosion with {erosion_iterations} iterations for marker refinement...")
-            eroded_for_markers = working_grid_for_markers
+            eroded = binary_bool.copy()
             for _ in range(erosion_iterations):
-                eroded_for_markers = morphology.binary_erosion(eroded_for_markers)
+                eroded = morphology.binary_erosion(eroded)
 
-            if np.sum(eroded_for_markers) == 0:
+            if eroded.any():
+                distance_for_markers = self.distance_transform_edt(eroded, sampling=sampling)
+            else:
                 print(
                     "Warning: Erosion for marker refinement resulted in an empty grid. Using original grid for markers."
                 )
-                sdf_for_markers = sdf  # Use original SDF if erosion fails
-            else:
-                sdf_for_markers = self.compute_sdf(eroded_for_markers, scale=sdf_scale)
+                distance_for_markers = distance_inside
         else:
-            sdf_for_markers = sdf
+            distance_for_markers = distance_inside
 
-        # Step 3: Find watershed markers using SDF local maxima
-        print("Detecting watershed markers from SDF...")
+        print("Detecting watershed markers from distance transform...")
 
-        # Use SDF values directly for marker detection (positive values = inside objects)
-        # Ensure markers are sought within the *original* binary_grid or appropriately adjusted one
-        # if erosion was meant to also modify the mask for watershed.
-        # Here, sdf_inside uses binary_grid to mask sdf_for_markers.
-        sdf_inside = np.where(binary_grid, sdf_for_markers, -np.inf)
+        positive_distances = distance_for_markers[distance_for_markers > 0]
+        if positive_distances.size == 0:
+            print("Warning: No positive distances for marker detection. Falling back to connected components.")
+            return self._connected_components_segmentation(binary_grid)
 
-        # Find local maxima in the SDF
+        threshold_abs = np.percentile(positive_distances, marker_threshold_percentile)
+
         peak_coords = peak_local_max(
-            sdf_inside,
-            min_distance=min_distance,
-            threshold_abs=np.percentile(sdf_inside[sdf_inside > -np.inf], marker_threshold_percentile)
-            if np.any(sdf_inside > -np.inf)
-            else None,
+            distance_for_markers,
+            min_distance=max(1, min_distance),
+            threshold_abs=threshold_abs,
+            labels=binary_bool,
             exclude_border=False,
         )
 
-        # Create marker array
-        local_maxi_mask = np.zeros(sdf.shape, dtype=bool)
+        # Create marker array and ensure at least one marker per connected component
+        markers_bool = np.zeros(distance_for_markers.shape, dtype=bool)
         if len(peak_coords) > 0:
-            local_maxi_mask[tuple(peak_coords.T)] = True
+            markers_bool[tuple(peak_coords.T)] = True
 
-        markers, num_markers_found = measure.label(local_maxi_mask, return_num=True)
+        component_labels, num_components = measure.label(binary_bool, return_num=True, connectivity=3)
+        if num_components == 0:
+            print("Warning: No foreground components found. Returning empty segmentation.")
+            return np.zeros_like(binary_grid, dtype=np.int32), 0
+
+        component_has_marker = np.zeros(num_components + 1, dtype=bool)
+        if markers_bool.any():
+            component_has_marker[np.unique(component_labels[markers_bool])] = True
+
+        missing_components = np.where(~component_has_marker[1:])[0] + 1
+        if missing_components.size > 0:
+            print(
+                f"Adding fallback markers for {missing_components.size} component(s) without detected peaks."
+            )
+            max_positions = ndimage.maximum_position(
+                distance_for_markers, labels=component_labels, index=missing_components
+            )
+            if missing_components.size == 1:
+                max_positions = [max_positions]
+            for coord in max_positions:
+                if coord is None:
+                    continue
+                markers_bool[tuple(coord)] = True
+
+        markers, num_markers_found = measure.label(markers_bool, return_num=True)
         print(f"Found {num_markers_found} markers for SDF watershed.")
 
         if num_markers_found == 0:
             print("Warning: No markers found for SDF watershed. Falling back to connected components.")
             return self._connected_components_segmentation(binary_grid)
 
-        # Step 4: Perform watershed using negative SDF as the distance map
-        # We use negative SDF because watershed finds minima, but we want to segment from maxima
-        print("Performing watershed on SDF...")
-        # The mask for watershed should be the original binary_grid, not an eroded one unless intended
-        use_gpu = self._should_use_gpu(sdf.size)
+        # Step 4: Perform watershed using negative distance transform (maxima at grain centers)
+        print("Performing watershed on distance transform...")
+        use_gpu = self._should_use_gpu(distance_inside.size)
         if use_gpu:
             print(f"Using {self.gpu_backend_name.upper()} acceleration for SDF watershed")
-            labels = _gpu_ops.watershed_segmentation(-sdf, markers, binary_grid)
+            labels = _gpu_ops.watershed_segmentation(-distance_inside, markers, binary_bool)
         else:
-            labels = watershed(-sdf, markers, mask=binary_grid)
+            labels = watershed(-distance_inside, markers, mask=binary_bool)
 
         num_labels = len(np.unique(labels)) - 1  # Exclude background (0)
         print(f"SDF-based watershed segmentation found {num_labels} objects")
@@ -976,19 +1054,29 @@ class PolyhedronSegmentation:
                 current_grid = eroded_grid
 
         # Compute distance transform on the (potentially eroded) grid
+        # Use physical sampling (z, y, x)
+        sampling = tuple(self.voxel_spacing[::-1].tolist())
         if use_gpu:
-            print(f"Computing distance transform using {self.gpu_backend_name.upper()} acceleration")
-            distance = _gpu_ops.distance_transform_edt(current_grid)
+            print(f"Computing distance transform using {self.gpu_backend_name.upper()} acceleration with sampling={sampling}")
+            distance = _gpu_ops.distance_transform_edt(current_grid, sampling=sampling)
         else:
-            distance = ndimage.distance_transform_edt(current_grid)
+            distance = ndimage.distance_transform_edt(current_grid, sampling=sampling)
 
         # Optionally smooth the distance transform
         if gaussian_smooth_dt_sigma > 0:
-            print(f"Smoothing distance transform with sigma: {gaussian_smooth_dt_sigma}")
-            if use_gpu:
-                distance = _gpu_ops.gaussian_filter(distance, sigma=gaussian_smooth_dt_sigma)
+            # Anisotropic sigma scaled to spacing
+            spacing = self.voxel_spacing.astype(float)
+            if np.any(np.abs(spacing - spacing.min()) > 1e-9):
+                sigma_xyz = gaussian_smooth_dt_sigma * (spacing.min() / spacing)
             else:
-                distance = filters.gaussian(distance, sigma=gaussian_smooth_dt_sigma)
+                sigma_xyz = np.array([gaussian_smooth_dt_sigma] * 3, dtype=float)
+            sigma_zyx = tuple(sigma_xyz[::-1].tolist())
+
+            print(f"Smoothing distance transform with sigma (zyx): {sigma_zyx}")
+            if use_gpu:
+                distance = _gpu_ops.gaussian_filter(distance, sigma=sigma_zyx)
+            else:
+                distance = filters.gaussian(distance, sigma=sigma_zyx)
 
         # Define footprint for peak_local_max
         footprint = None
@@ -1709,6 +1797,10 @@ class PolyhedronSegmentation:
             )
         elif fast_mesh_extraction:
             # Use optimized batch processing
+            worker_count = kwargs.get("num_workers", num_workers)
+            if not worker_count or worker_count < 1:
+                worker_count = 1
+
             candidate_polyhedron_mesh_data_list = self._extract_polyhedrons_fast(
                 labeled_grid,
                 label_ids_to_process,
@@ -1720,7 +1812,7 @@ class PolyhedronSegmentation:
                 skip_sdf_for_small,
                 small_polyhedron_threshold,
                 reduce_smoothing_for_small,
-                num_workers,
+                worker_count,
             )
         else:
             # Use original method
@@ -2026,21 +2118,17 @@ class PolyhedronSegmentation:
         coords = np.argwhere(target_mask)
         label_values = labeled_grid[target_mask]
 
-        # Group coordinates by label - ULTRA FAST VECTORIZED GROUPING
+        # Group coordinates by label - vectorized approach
         print("Grouping coordinates by polyhedron labels...")
+        order = np.argsort(label_values, kind="mergesort")
+        sorted_labels = label_values[order]
+        sorted_coords = coords[order]
 
-        # Use vectorized approach instead of slow loop
-        coord_groups = {}
-        for coord, label in tqdm(
-            zip(coords, label_values), desc="Grouping coordinates", total=len(coords), unit="voxels"
-        ):
-            if label not in coord_groups:
-                coord_groups[label] = []
-            coord_groups[label].append(coord)
+        unique_labels, counts = np.unique(sorted_labels, return_counts=True)
+        split_indices = np.cumsum(counts)[:-1]
+        coord_splits = np.split(sorted_coords, split_indices)
 
-        # Convert to numpy arrays for efficiency
-        for label in coord_groups:
-            coord_groups[label] = np.array(coord_groups[label])
+        coord_groups = {int(label): coords_part for label, coords_part in zip(unique_labels, coord_splits)}
 
         # Process each polyhedron using pre-computed coordinates
         print(f"Processing {len(coord_groups)} polyhedrons with vectorized approach...")
@@ -2770,17 +2858,28 @@ class PolyhedronSegmentation:
             print(f"  - Filtering by max voxel aspect ratio ({max_voxel_aspect_ratio})...")
             initial_count_before_aspect_filter = len(label_ids_to_process)
             label_ids_after_aspect_ratio_filter = []
+
+            # Pre-compute bounding boxes for all labels (1-indexed) using ndimage.find_objects
+            label_slices = ndimage.find_objects(labeled_grid)
+
             for label_id in tqdm(label_ids_to_process, desc="Aspect ratio filtering", unit="polyhedrons"):
-                coords = np.argwhere(labeled_grid == label_id)
-                if coords.shape[0] < 2:
+                slice_idx = label_id - 1
+                if slice_idx < 0 or slice_idx >= len(label_slices):
+                    # Should not happen, but keep label if slice missing
                     label_ids_after_aspect_ratio_filter.append(label_id)
                     continue
 
-                min_coords = np.min(coords, axis=0)
-                max_coords = np.max(coords, axis=0)
-                dims = max_coords - min_coords + 1
-                dims = np.maximum(dims, 1)
-                current_aspect_ratio = np.max(dims) / np.min(dims)
+                slc = label_slices[slice_idx]
+                if slc is None:
+                    label_ids_after_aspect_ratio_filter.append(label_id)
+                    continue
+
+                dims = np.array([axis_slice.stop - axis_slice.start for axis_slice in slc], dtype=np.int32)
+                if np.any(dims <= 0):
+                    label_ids_after_aspect_ratio_filter.append(label_id)
+                    continue
+
+                current_aspect_ratio = float(np.max(dims)) / float(np.min(dims))
 
                 if current_aspect_ratio <= max_voxel_aspect_ratio:
                     label_ids_after_aspect_ratio_filter.append(label_id)
@@ -2816,7 +2915,9 @@ class PolyhedronSegmentation:
 
         if fast_mesh_extraction:
             # Use optimized batch processing with optimal worker count
-            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive", num_workers))
+            resolved_workers = num_workers if num_workers and num_workers > 0 else get_optimal_worker_count(
+                "cpu_intensive", num_workers
+            )
             candidate_polyhedron_mesh_data_list = self._extract_polyhedrons_fast(
                 labeled_grid,
                 label_ids_to_process,
@@ -2828,14 +2929,16 @@ class PolyhedronSegmentation:
                 skip_sdf_for_small,
                 small_polyhedron_threshold,
                 reduce_smoothing_for_small,
-                optimal_workers,
+                resolved_workers,
                 target_vertices,
             )
         elif num_workers > 1 and len(label_ids_to_process) > 1:
             # Optimize worker count for CPU-intensive mesh extraction
-            optimal_workers = min(num_workers, get_optimal_worker_count("cpu_intensive", num_workers))
-            print(f"Using {optimal_workers} parallel workers for mesh extraction...")
-            with concurrent.futures.ProcessPoolExecutor(max_workers=optimal_workers) as executor:
+            resolved_workers = num_workers if num_workers and num_workers > 0 else get_optimal_worker_count(
+                "cpu_intensive", num_workers
+            )
+            print(f"Using {resolved_workers} parallel workers for mesh extraction...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=resolved_workers) as executor:
                 futures = [
                     executor.submit(
                         _global_mesh_task,
@@ -4069,6 +4172,12 @@ def main():
         help="Export segmentation to Paraview .vtm (multiblock) or .vtp (single) file. Filename determines type, or provide suffix.",
     )
     parser.add_argument(
+        "--skip-paraview-export",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip Paraview export entirely (useful when only JSON output is needed).",
+    )
+    parser.add_argument(
         "--paraview-multiblock",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -4382,25 +4491,29 @@ def main():
 
         # Paraview export
         paraview_output_path = args.paraview_export
-        if not paraview_output_path and args.output:  # Default paraview export name if not specified
-            paraview_output_path = Path(args.output).with_suffix(".vtm" if args.paraview_multiblock else ".vtu")
+        if isinstance(paraview_output_path, str) and paraview_output_path.lower() in {"none", "skip", "false"}:
+            paraview_output_path = None
 
-        if paraview_output_path:
-            # Ensure correct suffix based on multiblock flag if not already set by user
-            paraview_path_obj = Path(paraview_output_path)
-            expected_suffix = ".vtm" if args.paraview_multiblock else ".vtu"
-            if paraview_path_obj.suffix.lower() != expected_suffix.lower():
-                paraview_output_path = str(paraview_path_obj.with_suffix(expected_suffix))
+        if not args.skip_paraview_export:
+            if not paraview_output_path and args.output:  # Default Paraview export name if not specified
+                paraview_output_path = Path(args.output).with_suffix(".vtm" if args.paraview_multiblock else ".vtu")
 
-            segmentation.save_to_paraview(
-                polyhedrons_data,
-                paraview_output_path,
-                multiblock=args.paraview_multiblock,
-                include_z_depth=args.include_z_depth,
-                fast_export=args.fast_paraview_export,
-                export_batch_size=args.export_batch_size,
-                num_export_workers=args.num_export_workers,
-            )
+            if paraview_output_path:
+                # Ensure correct suffix based on multiblock flag if not already set by user
+                paraview_path_obj = Path(paraview_output_path)
+                expected_suffix = ".vtm" if args.paraview_multiblock else ".vtu"
+                if paraview_path_obj.suffix.lower() != expected_suffix.lower():
+                    paraview_output_path = str(paraview_path_obj.with_suffix(expected_suffix))
+
+                segmentation.save_to_paraview(
+                    polyhedrons_data,
+                    paraview_output_path,
+                    multiblock=args.paraview_multiblock,
+                    include_z_depth=args.include_z_depth,
+                    fast_export=args.fast_paraview_export,
+                    export_batch_size=args.export_batch_size,
+                    num_export_workers=args.num_export_workers,
+                )
 
         # Visualization
         if args.visualize or args.screenshot:
