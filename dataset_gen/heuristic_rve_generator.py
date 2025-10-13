@@ -29,6 +29,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 
 # -----------------------------------------------------------------------------
@@ -545,7 +546,7 @@ def generate_dataset(
     volume_stats: List[Dict] = []
     solid_fractions: List[float] = []
 
-    for idx in range(num_volumes):
+    for idx in tqdm(range(num_volumes), desc="Generating volumes"):
         volume, meta = generate_volume(profile, rng)
         tensor = torch.from_numpy(volume.astype(np.uint8))
         chunk.append(tensor)
