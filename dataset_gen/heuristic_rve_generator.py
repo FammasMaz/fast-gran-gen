@@ -23,6 +23,7 @@ import gzip
 import json
 import math
 import os
+import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -107,6 +108,20 @@ DEFAULT_PROFILES: Dict[str, Dict] = {
         },
     }
 }
+
+_WORKER_PROFILE: Optional[Dict] = None
+
+
+def _init_worker_profile(profile: Dict) -> None:
+    global _WORKER_PROFILE
+    _WORKER_PROFILE = profile
+
+
+def _worker_generate_volume(args: Tuple[int, int]) -> Tuple[int, np.ndarray, Dict]:
+    idx, seed = args
+    rng = np.random.default_rng(seed)
+    volume, metadata = generate_volume(_WORKER_PROFILE, rng)
+    return idx, volume, metadata
 
 
 def to_serializable(obj):
@@ -530,6 +545,7 @@ def generate_dataset(
     num_volumes: int,
     volumes_per_file: int,
     seed: int,
+    num_workers: int = 1,
 ) -> Dict:
     """
     Generate a dataset of volumes and save them in pipeline-compatible chunks.
@@ -539,15 +555,17 @@ def generate_dataset(
 
     profile = DEFAULT_PROFILES[profile_name]
 
-    rng = np.random.default_rng(seed)
+    master_rng = np.random.default_rng(seed)
+    volume_seeds = master_rng.integers(0, 2**32 - 1, size=num_volumes, dtype=np.uint32)
+
     saved_files: List[str] = []
     chunk: List[torch.Tensor] = []
 
     volume_stats: List[Dict] = []
     solid_fractions: List[float] = []
 
-    for idx in tqdm(range(num_volumes), desc="Generating volumes"):
-        volume, meta = generate_volume(profile, rng)
+    def handle_volume(idx: int, volume: np.ndarray, meta: Dict) -> None:
+        nonlocal chunk
         tensor = torch.from_numpy(volume.astype(np.uint8))
         chunk.append(tensor)
         volume_stats.append(meta)
@@ -558,6 +576,22 @@ def generate_dataset(
             path = save_volume_chunk(chunk, output_dir, chunk_idx)
             saved_files.append(path)
             chunk = []
+
+    worker_count = max(1, num_workers)
+
+    if worker_count == 1:
+        for idx in tqdm(range(num_volumes), desc="Generating volumes"):
+            rng = np.random.default_rng(int(volume_seeds[idx]))
+            volume, meta = generate_volume(profile, rng)
+            handle_volume(idx, volume, meta)
+    else:
+        ctx = mp.get_context("spawn")
+        tasks = ((idx, int(volume_seeds[idx])) for idx in range(num_volumes))
+        with ctx.Pool(processes=worker_count, initializer=_init_worker_profile, initargs=(profile,)) as pool:
+            for idx, volume, meta in tqdm(
+                pool.imap(_worker_generate_volume, tasks, chunksize=1), total=num_volumes, desc="Generating volumes"
+            ):
+                handle_volume(idx, volume, meta)
 
     return {
         "profile": profile_name,
@@ -585,18 +619,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-volumes", type=int, default=128, help="Total number of RVE volumes to generate.")
     parser.add_argument("--volumes-per-file", type=int, default=128, help="Number of volumes stored per .pt.gz chunk.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of parallel workers to use (0 selects all available CPU cores).",
+    )
     parser.add_argument("--metadata-path", type=Path, help="Optional path for JSON metadata summary.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    worker_count = args.num_workers if args.num_workers > 0 else max(1, os.cpu_count() or 1)
     summary = generate_dataset(
         profile_name=args.profile,
         output_dir=args.output_dir,
         num_volumes=args.num_volumes,
         volumes_per_file=args.volumes_per_file,
         seed=args.seed,
+        num_workers=worker_count,
     )
 
     metadata_path = args.metadata_path or (args.output_dir / "generation_metadata.json")

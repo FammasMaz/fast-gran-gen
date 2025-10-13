@@ -235,12 +235,14 @@ python dataset_gen/heuristic_rve_generator.py \
   --output-dir out/sand_mixed \
   --num-volumes 256 \
   --volumes-per-file 64 \
+  --num-workers 0 \
   --seed 13
 ```
 
 - Produces `32×64×64` binary voxels stored as `.pt.gz` shards; compatible with `dataset_gen/hdf5_maker.py` for HDF5 packing.
 - Configurable grain families (dense sand, fine sand, recycled chunks) plus fines-only filling and post-processing via `dataset_gen/heuristic_rve_generator.py`.
 - Emits `generation_metadata.json` summarising solid fractions before/after post-processing, placement attempt statistics, and all profile parameters.
+- Control CPU usage via `--num-workers` (set it to 0 to automatically use all available cores).
 
 Re-run `dataset_gen/hdf5_maker.py` on the generated shard directory to assemble a single HDF5 volume for training.
 
