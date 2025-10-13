@@ -223,8 +223,26 @@ python polyhedron_segmentation.py \
           --num-export-workers 6 \
           --export-batch-size 400 \
           --max-chunk-workers 6 \
-          --no-paraview-multiblock
+--no-paraview-multiblock
 ```
+
+## Heuristic Dataset Generation for Civil Sands
+
+You can synthesize diffusion-ready RVEs for dense civil sands and recycled aggregates using a purely procedural generator. The script packs superquadric grains via gravity-driven placement, adds fines to close voids, and performs a light morphological closing to reach realistic solid fractions (~0.55).
+
+```bash
+python dataset_gen/heuristic_rve_generator.py \
+  --output-dir out/sand_mixed \
+  --num-volumes 256 \
+  --volumes-per-file 64 \
+  --seed 13
+```
+
+- Produces `32×64×64` binary voxels stored as `.pt.gz` shards; compatible with `dataset_gen/hdf5_maker.py` for HDF5 packing.
+- Configurable grain families (dense sand, fine sand, recycled chunks) plus fines-only filling and post-processing via `dataset_gen/heuristic_rve_generator.py`.
+- Emits `generation_metadata.json` summarising solid fractions before/after post-processing, placement attempt statistics, and all profile parameters.
+
+Re-run `dataset_gen/hdf5_maker.py` on the generated shard directory to assemble a single HDF5 volume for training.
 
 ## Additional Tools
 

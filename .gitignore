@@ -5,3 +5,5 @@ out.nosync
 .vscode
 .DS_Store
 .gitmessage
+# Local heuristic sand RVE test output
+out/
