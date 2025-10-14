@@ -14,7 +14,6 @@ def process_file(file_path):
             data_list = torch.load(gz_f, map_location="cpu")
             tensors = []
             for tensor in data_list:
-                # Each file has a list of 128 voxels, each of shape (32, 64, 64)
                 if isinstance(tensor, torch.Tensor):
                     tensors.append(tensor.cpu().numpy().astype(np.uint8))
             return (file_path, tensors)
@@ -23,13 +22,15 @@ def process_file(file_path):
         return (file_path, None)
 
 
-def create_hdf5_file(voxel_dir, hdf5_path, total_voxels=56704, num_workers=8):
+def create_hdf5_file(voxel_dir, hdf5_path, total_voxels=56704, num_workers=8, voxel_shape=(32, 64, 64)):
     """
     Create HDF5 file from .pt.gz files using parallel processing.
 
     Args:
         voxel_dir (str): Directory containing .pt.gz voxel files.
         hdf5_path (str): Output HDF5 file path.
+        total_voxels (int): Total number of voxels to write.
+        voxel_shape (tuple[int, int, int]): (depth, height, width) stored per sample.
     """
     if os.path.exists(hdf5_path):
         print(f"HDF5 file already exists at {hdf5_path}. Remove it or specify a new path.")
@@ -43,7 +44,7 @@ def create_hdf5_file(voxel_dir, hdf5_path, total_voxels=56704, num_workers=8):
     with h5py.File(hdf5_path, "w") as f:
         dset = f.create_dataset(
             "voxels",
-            shape=(total_voxels, 32, 64, 64),
+            shape=(total_voxels, *voxel_shape),
             dtype="uint8",
             compression="gzip",
             compression_opts=4,
@@ -57,7 +58,11 @@ def create_hdf5_file(voxel_dir, hdf5_path, total_voxels=56704, num_workers=8):
 
             for file_path, tensors in results:
                 if tensors is not None and len(tensors) > 0:
-                    tensors_np = np.stack(tensors, axis=0)  # shape: (N, 32, 64, 64)
+                    tensors_np = np.stack(tensors, axis=0)
+                    if tensors_np.shape[1:] != tuple(voxel_shape):
+                        raise ValueError(
+                            f"Voxel shape mismatch in {file_path}: expected {voxel_shape}, got {tensors_np.shape[1:]}"
+                        )
 
                     n_voxels = len(tensors_np)
                     if current_idx + n_voxels > total_voxels:
@@ -96,6 +101,7 @@ if __name__ == "__main__":
             hdf5_file_path,
             total_voxels=total_voxels,
             num_workers=40,  # change it according to the need
+            voxel_shape=(32, 64, 64),
         )
     else:
         print("HDF5 file already exists.")

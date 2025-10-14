@@ -7,3 +7,4 @@ out.nosync
 .gitmessage
 # Local heuristic sand RVE test output
 out/
+data/
