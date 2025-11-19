@@ -118,14 +118,19 @@ def main():
             vtk_path = os.path.join(args.output_dir, f"{args.filename}.vti")
 
             # Create a PyVista grid
-            grid = pv.UniformGrid()
+            # Handle different PyVista versions (UniformGrid vs ImageData)
+            try:
+                grid = pv.UniformGrid()
+            except AttributeError:
+                # Fallback for older versions or specific environments
+                grid = pv.ImageData()
+
             grid.dimensions = np.array(regolith_volume.shape) + 1
             grid.spacing = (1, 1, 1)  # Assuming unit spacing
             grid.origin = (0, 0, 0)
 
             # Add the data
             # PyVista expects data in column-major order (F-contiguous) when flattened
-            # or we can just transpose to match
             grid.cell_data["Density"] = regolith_volume.flatten(order="F")
 
             grid.save(vtk_path)

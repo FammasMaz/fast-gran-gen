@@ -440,7 +440,7 @@ def batch_inpaint_junctions(
     """
     Batch process multiple junctions for inpainting to leverage GPU parallelization.
     Now includes automatic batch chunking to avoid CUDA OOM errors.
-    
+
     Args:
         full_volume_pt: The full volume tensor on GPU
         junction_infos: List of junction information dictionaries
@@ -456,13 +456,13 @@ def batch_inpaint_junctions(
         inpaint_region_size_ratio: Size ratio for inpainting region
         axis: Axis along which to inpaint
         max_batch_size: Maximum batch size to avoid OOM (auto-detect if None)
-    
+
     Returns:
         Updated full_volume_pt with inpainted junctions
     """
     if not junction_infos:
         return full_volume_pt
-    
+
     # Auto-detect max batch size based on available GPU memory if not specified
     if max_batch_size is None:
         # Conservative estimate: start with a reasonable batch size
@@ -476,20 +476,22 @@ def batch_inpaint_junctions(
             max_batch_size = 15
         else:
             max_batch_size = 10  # Conservative for very large batches
-    
+
     # Split junctions into chunks if needed
     if len(junction_infos) > max_batch_size:
         logger.info(f"Splitting {len(junction_infos)} junctions into chunks of {max_batch_size} to avoid OOM")
-        
+
         # Process junctions in chunks
         for chunk_start in range(0, len(junction_infos), max_batch_size):
             chunk_end = min(chunk_start + max_batch_size, len(junction_infos))
             chunk_infos = junction_infos[chunk_start:chunk_end]
             chunk_seed = seed + chunk_start  # Different seed for each chunk
-            
-            logger.info(f"Processing junction chunk {chunk_start//max_batch_size + 1}/{(len(junction_infos) + max_batch_size - 1)//max_batch_size}: "
-                       f"junctions {chunk_start}-{chunk_end-1} ({len(chunk_infos)} junctions)")
-            
+
+            logger.info(
+                f"Processing junction chunk {chunk_start // max_batch_size + 1}/{(len(junction_infos) + max_batch_size - 1) // max_batch_size}: "
+                f"junctions {chunk_start}-{chunk_end - 1} ({len(chunk_infos)} junctions)"
+            )
+
             # Recursively call with smaller batch
             full_volume_pt = batch_inpaint_junctions(
                 full_volume_pt=full_volume_pt,
@@ -507,38 +509,40 @@ def batch_inpaint_junctions(
                 axis=axis,
                 max_batch_size=max_batch_size,  # Maintain the same batch size
             )
-            
+
             # Clear cache between chunks
             torch.cuda.empty_cache()
-        
+
         return full_volume_pt
-    
+
     # Original batch processing logic (for batches <= max_batch_size)
     inpainting_unet = inpainting_pipeline.unet
     inpainting_scheduler = inpainting_pipeline.scheduler
     inpainting_scheduler.set_timesteps(num_inference_steps)
     inpainting_unet.eval()
-    
+
     # Extract all junction regions and create masks
     batch_image_slices = []
     batch_masks = []
     batch_regions = []
-    
+
     logger.info(f"Preparing batch of {len(junction_infos)} junctions for parallel inpainting")
-    
+
     valid_junction_infos = []
     for i, junction_info in enumerate(junction_infos):
-        region_start_d = junction_info['region_start_d']
-        region_end_d = junction_info['region_end_d']
-        junction_center_d = junction_info['junction_center_d']
-        gap_size = junction_info.get('gap_size', 0)
-        
+        region_start_d = junction_info["region_start_d"]
+        region_end_d = junction_info["region_end_d"]
+        junction_center_d = junction_info["junction_center_d"]
+        gap_size = junction_info.get("gap_size", 0)
+
         # Check if region is valid
         region_depth = region_end_d - region_start_d
         if region_depth <= 0:
-            logger.warning(f"Skipping junction {i} with invalid region depth: {region_depth} (start={region_start_d}, end={region_end_d})")
+            logger.warning(
+                f"Skipping junction {i} with invalid region depth: {region_depth} (start={region_start_d}, end={region_end_d})"
+            )
             continue
-            
+
         # Extract junction slice based on axis
         if axis == 0:
             image_slice = full_volume_pt[0, :, region_start_d:region_end_d, :, :].clone()
@@ -548,27 +552,27 @@ def batch_inpaint_junctions(
             image_slice = full_volume_pt[0, :, :, :, region_start_d:region_end_d].clone()
         else:
             raise ValueError(f"Unsupported axis: {axis}")
-        
+
         # Validate slice dimensions
         if image_slice.numel() == 0:
             logger.warning(f"Skipping junction {i} with empty slice dimensions: {image_slice.shape}")
             continue
-            
+
         batch_image_slices.append(image_slice)
         batch_regions.append((region_start_d, region_end_d))
         valid_junction_infos.append(junction_info)
-        
+
         # Create mask for this junction
         junction_local_center = junction_center_d - region_start_d
-        
+
         if use_gap_filling:
             mask_width = gap_size
         else:
             mask_width = int(region_depth * inpaint_region_size_ratio)
-        
+
         mask_start = max(0, junction_local_center - mask_width // 2)
         mask_end = min(region_depth, mask_start + mask_width)
-        
+
         mask = torch.zeros_like(image_slice)
         if axis == 0:
             mask[:, mask_start:mask_end, :, :] = 1.0
@@ -577,77 +581,99 @@ def batch_inpaint_junctions(
         elif axis == 2:
             mask[:, :, :, mask_start:mask_end] = 1.0
         batch_masks.append(mask)
-    
+
     # If no valid junctions, return early
     if not batch_image_slices:
         logger.info("No valid junctions found for batch inpainting")
         return full_volume_pt
-    
-    # Stack into batch tensors
+
+        # Stack into batch tensors
     batch_image_slices = torch.stack(batch_image_slices, dim=0)  # (B, C, D, H, W)
     batch_masks = torch.stack(batch_masks, dim=0)  # (B, C, D, H, W)
-    batch_mask_unet_input = batch_masks[:, 0:1, ...].to(device)  # (B, 1, D, H, W)
-    
+
+    # Permute axes if needed to align stitching axis with Depth (D)
+    # The UNet likely expects the gap to be along the D axis (dim 2)
+    if axis == 1:
+        # Swap D and H: (B, C, D, H, W) -> (B, C, H, D, W)
+        batch_image_slices = batch_image_slices.permute(0, 1, 3, 2, 4)
+        batch_masks = batch_masks.permute(0, 1, 3, 2, 4)
+    elif axis == 2:
+        # Swap D and W: (B, C, D, H, W) -> (B, C, W, H, D)
+        batch_image_slices = batch_image_slices.permute(0, 1, 4, 3, 2)
+        batch_masks = batch_masks.permute(0, 1, 4, 3, 2)
+
+    batch_mask_unet_input = batch_masks[:, 0:1, ...].to(device)  # (B, 1, D, H, W) after permute
+
     # Move to device
     batch_image_slices = batch_image_slices.to(device)
     batch_masks = batch_masks.to(device)
-    
+
     # Generate seeds for each junction
     batch_generators = []
     for i in range(len(junction_infos)):
         junction_seed = seed + i * 1000
         generator = torch.Generator(device=device).manual_seed(junction_seed)
         batch_generators.append(generator)
-    
+
     # Main batch inpainting process
-    logger.info(f"Starting batch inpainting for {len(junction_infos)} junctions")
-    
+    logger.info(f"Starting batch inpainting for {len(junction_infos)} junctions (Axis {axis})")
+
     try:
         timesteps = inpainting_scheduler.timesteps
-        
+
         # Create initial noise for entire batch
         batch_latents = torch.randn(batch_image_slices.shape, device=device)
-        
+
         # Create masked images for entire batch
         batch_masked_images = batch_image_slices * (1.0 - batch_masks) - batch_masks
-        
+
         # Scale initial noise if needed
         if hasattr(inpainting_scheduler, "init_noise_sigma"):
             batch_latents = batch_latents * inpainting_scheduler.init_noise_sigma
-        
+
         with torch.inference_mode():
             for i_step, t in enumerate(tqdm(timesteps, desc="Batch Inpainting", leave=False)):
                 # Prepare batch input for UNet
                 t_input = t.repeat(batch_image_slices.shape[0])  # Batch size
-                
+
                 # For inpainting UNet: concatenate [noisy_latents, mask, masked_images]
                 unet_input = torch.cat([batch_latents, batch_mask_unet_input, batch_masked_images], dim=1)
-                
+
                 # Batch predict noise
                 noise_pred = inpainting_unet(unet_input, t_input, return_dict=False)[0]
-                
+
                 # Batch scheduler step
                 step_output = inpainting_scheduler.step(noise_pred, t, batch_latents)
                 x_prev_denoised_candidate = step_output.prev_sample
-                
+
                 # RePaint-like guidance for batch
                 if i_step < len(timesteps) - 1:
                     prev_t = timesteps[i_step + 1]
                     noise_for_gt_conditioning = torch.randn(
                         batch_image_slices.shape, device=device, dtype=batch_image_slices.dtype
                     )
-                    
+
                     # Add noise to original images
                     x_prev_noised_known_gt = inpainting_scheduler.add_noise(
                         batch_image_slices, noise_for_gt_conditioning, prev_t.unsqueeze(0)
                     )
-                    
+
                     # Composite: use inpainted prediction for masked areas, noisy GT for known areas
-                    batch_latents = x_prev_denoised_candidate * batch_masks + x_prev_noised_known_gt * (1.0 - batch_masks)
+                    batch_latents = x_prev_denoised_candidate * batch_masks + x_prev_noised_known_gt * (
+                        1.0 - batch_masks
+                    )
                 else:
                     # Last step: composite final x0 prediction
                     batch_latents = x_prev_denoised_candidate * batch_masks + batch_image_slices * (1.0 - batch_masks)
-        
+
+        # Permute back to original orientation if needed
+        if axis == 1:
+            # Swap H and D back: (B, C, H, D, W) -> (B, C, D, H, W)
+            batch_latents = batch_latents.permute(0, 1, 3, 2, 4)
+        elif axis == 2:
+            # Swap W and D back: (B, C, W, H, D) -> (B, C, D, H, W)
+            batch_latents = batch_latents.permute(0, 1, 4, 3, 2)
+
         # Place results back into full volume based on axis
         for i, (region_start_d, region_end_d) in enumerate(batch_regions):
             if axis == 0:
@@ -656,9 +682,11 @@ def batch_inpaint_junctions(
                 full_volume_pt[0, :, :, region_start_d:region_end_d, :] = batch_latents[i]
             elif axis == 2:
                 full_volume_pt[0, :, :, :, region_start_d:region_end_d] = batch_latents[i]
-        
-        logger.info(f"Batch inpainting completed for {len(valid_junction_infos)} valid junctions out of {len(junction_infos)} total")
-        
+
+        logger.info(
+            f"Batch inpainting completed for {len(valid_junction_infos)} valid junctions out of {len(junction_infos)} total"
+        )
+
         # Save debug outputs if requested
         if output_dir:
             debug_dir = Path(output_dir) / f"batch_inpainting_debug_seed{seed}"
@@ -666,18 +694,19 @@ def batch_inpaint_junctions(
             for i in range(len(valid_junction_infos)):
                 result_np = pt_to_numpy(batch_latents[i])
                 np.save(debug_dir / f"batch_junction_{i:02d}.npy", result_np)
-        
+
     except Exception as e:
         logger.error(f"Error in batch inpainting: {e}")
         import traceback
+
         traceback.print_exc()
         # Fall back to sequential processing
         return full_volume_pt
-    
+
     # Cleanup
     del batch_image_slices, batch_masks, batch_latents, batch_masked_images
     torch.cuda.empty_cache()
-    
+
     return full_volume_pt
 
 
@@ -858,11 +887,11 @@ def generate_stitched_volume_with_inpainting(
 
     # inpainting seams using batch processing
     logger.info("Preparing junction information for batch inpainting")
-    
+
     # Collect all junction information first
     junction_infos = []
     inpainting_base_seed = seed + n_blocks
-    
+
     for i in range(n_blocks - 1):
         junction_idx = i + 1
 
@@ -890,26 +919,28 @@ def generate_stitched_volume_with_inpainting(
 
         # Collect junction information for batch processing
         junction_info = {
-            'junction_idx': junction_idx,
-            'region_start_d': region_start_d,
-            'region_end_d': region_end_d,
-            'junction_center_d': junction_center_d,
-            'region_depth': region_depth
+            "junction_idx": junction_idx,
+            "region_start_d": region_start_d,
+            "region_end_d": region_end_d,
+            "junction_center_d": junction_center_d,
+            "region_depth": region_depth,
         }
-        
+
         if use_gap_filling:
-            junction_info['gap_size'] = gap_size
-            
+            junction_info["gap_size"] = gap_size
+
         junction_infos.append(junction_info)
-        
+
         logger.info(
             f"Prepared junction {i + 1}/{n_blocks - 1} from depth {region_start_d} to {region_end_d} (size: {region_depth})"
         )
-    
+
     # Handle iterative inpainting fallback (not yet implemented for batch processing)
     if inpaint_iteratively:
-        logger.warning("Iterative inpainting not yet implemented for batch processing. Falling back to single-pass batch inpainting.")
-    
+        logger.warning(
+            "Iterative inpainting not yet implemented for batch processing. Falling back to single-pass batch inpainting."
+        )
+
     # Perform batch inpainting on all collected junctions
     if junction_infos:
         full_volume_pt = batch_inpaint_junctions(
@@ -927,7 +958,7 @@ def generate_stitched_volume_with_inpainting(
             inpaint_region_size_ratio=inpaint_region_size_ratio,
             max_batch_size=20,  # Conservative batch size to avoid OOM
         )
-    
+
     logger.info("Batch inpainting completed.")
     final_volume_np = pt_to_numpy(full_volume_pt.squeeze(0))  # Remove Batch dim
 
@@ -956,7 +987,7 @@ def stitch_blocks_with_batch_inpainting(
 ):
     """
     Stitch pre-generated blocks using the batch inpainting optimization.
-    
+
     Args:
         volumes: List of volumes to stitch
         axis: Axis along which to stitch (0, 1, or 2)
@@ -968,13 +999,13 @@ def stitch_blocks_with_batch_inpainting(
         seed: Random seed
         binary: Whether to apply binary thresholding
         debug: Whether to save debug information
-        
+
     Returns:
         Stitched volume as numpy array
     """
     if not volumes:
         return None
-        
+
     # Convert volumes to pytorch tensors if needed
     volumes_pt = []
     for vol in volumes:
@@ -982,46 +1013,46 @@ def stitch_blocks_with_batch_inpainting(
             vol_pt = numpy_to_pt(vol)
         else:
             vol_pt = vol
-        
+
         # Ensure proper tensor format: add channel dimension if needed
         if len(vol_pt.shape) == 3:  # (D, H, W) -> (1, D, H, W)
             vol_pt = vol_pt.unsqueeze(0)
-        
+
         volumes_pt.append(vol_pt)
-    
+
     # Calculate output dimensions
     volume_shape = volumes_pt[0].shape
     axis_size = volume_shape[axis + 1]  # +1 because of channel dimension
     n_blocks = len(volumes_pt)
-    
+
     # Calculate total size along the axis (gap-filling mode)
     total_axis_size = axis_size * n_blocks + overlap * (n_blocks - 1)
-        
+
     # Create output dimensions
     output_shape = list(volume_shape)
     output_shape[axis + 1] = total_axis_size
-    
+
     # Create full volume tensor
     full_volume_pt = torch.zeros(output_shape, device=device)
-    
+
     # Place volumes into the full volume
     current_pos = 0
     for i, vol in enumerate(volumes_pt):
         vol = vol.to(device)
-        
+
         if axis == 0:
-            full_volume_pt[:, current_pos:current_pos + axis_size, :, :] = vol
+            full_volume_pt[:, current_pos : current_pos + axis_size, :, :] = vol
         elif axis == 1:
-            full_volume_pt[:, :, current_pos:current_pos + axis_size, :] = vol
+            full_volume_pt[:, :, current_pos : current_pos + axis_size, :] = vol
         elif axis == 2:
-            full_volume_pt[:, :, :, current_pos:current_pos + axis_size] = vol
-        
+            full_volume_pt[:, :, :, current_pos : current_pos + axis_size] = vol
+
         current_pos += axis_size + overlap  # Gap-filling mode: add gap between volumes
-    
+
     # Add batch dimension if needed
     if len(full_volume_pt.shape) == 4:
         full_volume_pt = full_volume_pt.unsqueeze(0)
-    
+
     # Create junction information for batch inpainting
     junction_infos = []
     for i in range(n_blocks - 1):
@@ -1031,25 +1062,27 @@ def stitch_blocks_with_batch_inpainting(
         process_region_size = max(overlap * 3, 16)
         region_start = max(0, junction_center - process_region_size // 2)
         region_end = min(total_axis_size, region_start + process_region_size)
-        
-        junction_infos.append({
-            'junction_idx': i,
-            'region_start_d': region_start,
-            'region_end_d': region_end,
-            'junction_center_d': junction_center,
-            'region_depth': region_end - region_start,
-            'gap_size': overlap,  # In case gap_filling mode is used
-        })
-    
+
+        junction_infos.append(
+            {
+                "junction_idx": i,
+                "region_start_d": region_start,
+                "region_end_d": region_end,
+                "junction_center_d": junction_center,
+                "region_depth": region_end - region_start,
+                "gap_size": overlap,  # In case gap_filling mode is used
+            }
+        )
+
     # Use batch inpainting if pipeline is available
     if inpainting_pipeline is not None and len(junction_infos) > 0:
         logger.info(f"Performing batch inpainting for {len(junction_infos)} junctions")
-        
+
         # Create dummy args for batch inpainting
         dummy_args = argparse.Namespace(
             mask_type="gap_filling_compatible",
         )
-        
+
         batch_inpaint_junctions(
             full_volume_pt=full_volume_pt,
             junction_infos=junction_infos,
@@ -1066,15 +1099,15 @@ def stitch_blocks_with_batch_inpainting(
             axis=axis,  # Pass the axis parameter
             max_batch_size=20,  # Conservative batch size to avoid OOM
         )
-    
+
     # Convert back to numpy
     final_volume_np = pt_to_numpy(full_volume_pt.squeeze(0))
-    
+
     if final_volume_np.shape[0] == 1:
         final_volume_np = final_volume_np.squeeze(0)
-    
+
     if binary:
         final_volume_np = (final_volume_np > 0.5).astype(np.float32)
-    
+
     logger.info(f"Final stitched volume shape: {final_volume_np.shape}")
     return final_volume_np
