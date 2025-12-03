@@ -76,6 +76,84 @@ except ImportError:
     pass
 
 
+def save_vti_without_pyvista(data, output_path, spacing=(1.0, 1.0, 1.0)):
+    """
+    Save a 3D numpy array as VTI (VTK ImageData) file without PyVista.
+    Uses raw VTK XML format that can be opened in ParaView.
+
+    Args:
+        data: 3D numpy array
+        output_path: Path to save .vti file
+        spacing: Voxel spacing (dx, dy, dz)
+    """
+    import base64
+    import zlib
+
+    if isinstance(data, torch.Tensor):
+        data = data.cpu().numpy()
+
+    # Remove batch/channel dimensions
+    while data.ndim > 3:
+        data = data[0]
+
+    # Ensure float32 for compatibility
+    data = data.astype(np.float32)
+
+    nx, ny, nz = data.shape
+    dx, dy, dz = spacing
+
+    # Compress data with zlib
+    raw_data = data.flatten(order="F").tobytes()
+    compressed = zlib.compress(raw_data, level=6)
+    encoded = base64.b64encode(compressed).decode("ascii")
+
+    # Header for compressed data (4 bytes each: num_blocks, block_size, last_block_size, compressed_size)
+    header = np.array(
+        [1, len(raw_data), len(raw_data), len(compressed)], dtype=np.uint32
+    )
+    header_encoded = base64.b64encode(header.tobytes()).decode("ascii")
+
+    vti_content = f'''<?xml version="1.0"?>
+<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt32" compressor="vtkZLibDataCompressor">
+  <ImageData WholeExtent="0 {nx} 0 {ny} 0 {nz}" Origin="0 0 0" Spacing="{dx} {dy} {dz}">
+    <Piece Extent="0 {nx} 0 {ny} 0 {nz}">
+      <PointData>
+      </PointData>
+      <CellData Scalars="voxel_data">
+        <DataArray type="Float32" Name="voxel_data" format="binary">
+{header_encoded}{encoded}
+        </DataArray>
+      </CellData>
+    </Piece>
+  </ImageData>
+</VTKFile>
+'''
+
+    with open(output_path, "w") as f:
+        f.write(vti_content)
+
+    print(f"  Saved VTI file: {output_path} (shape: {data.shape})")
+    return True
+
+
+def save_blocks_as_vti(blocks, output_dir, prefix="block"):
+    """Save multiple voxel blocks as individual VTI files."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for i, block in enumerate(blocks):
+        vti_path = output_dir / f"{prefix}_{i:02d}.vti"
+        try:
+            save_vti_without_pyvista(block, vti_path)
+            saved.append(vti_path)
+        except Exception as e:
+            print(f"  Warning: Could not save block {i}: {e}")
+
+    print(f"  Saved {len(saved)} block VTI files to {output_dir}")
+    return saved
+
+
 def save_intermediate_visualization(data, output_path, title="", vmin=None, vmax=None):
     """Save a 3D volume visualization as PNG using orthogonal slices."""
     if not MPL_AVAILABLE:
@@ -186,7 +264,10 @@ def save_blocks_visualization(blocks, output_path, max_blocks=6):
 
 def save_3d_volume_render(volume, output_path, title=""):
     """Save a 3D volume render using PyVista."""
-    if not PYVISTA_AVAILABLE or pv is None:
+    global pv, PYVISTA_AVAILABLE
+
+    # Lazy check - only test PyVista on first actual use
+    if not _check_pyvista_available():
         print(f"  Skipping 3D render (PyVista not available): {output_path}")
         return False
 
@@ -233,6 +314,9 @@ def save_3d_volume_render(volume, output_path, title=""):
         return True
     except Exception as e:
         print(f"  Warning: Could not save 3D render {output_path}: {e}")
+        # Mark PyVista as unavailable to avoid future crashes
+        PYVISTA_AVAILABLE = False
+        return False
         return False
 
 
@@ -901,6 +985,13 @@ def create_strips_in_batches(
                 )
                 print(f"    Saved {len(blocks_to_save)} blocks to sampled_blocks.npz")
 
+                # Save individual blocks as VTI files for ParaView
+                save_blocks_as_vti(
+                    blocks_to_save[:6],  # Save first 6 blocks
+                    intermediates_dir / "blocks_vti",
+                    prefix="block",
+                )
+
                 # Generate visualization
                 save_blocks_visualization(
                     all_blocks[: min(6, len(all_blocks))],
@@ -1112,6 +1203,14 @@ def create_railway_track_3d(
         np.savez(intermediates_dir / "stitched_volume.npz", volume=final_track)
         print(f"  Saved stitched volume to stitched_volume.npz")
 
+        # Save the stitched volume as VTI for ParaView
+        try:
+            save_vti_without_pyvista(
+                final_track, intermediates_dir / "stitched_volume.vti"
+            )
+        except Exception as e:
+            print(f"  Warning: Could not save stitched VTI: {e}")
+
         # Save 2D slice visualization
         save_intermediate_visualization(
             final_track,
@@ -1119,7 +1218,7 @@ def create_railway_track_3d(
             title=f"Stitched Volume ({final_track.shape[0]}x{final_track.shape[1]}x{final_track.shape[2]})",
         )
 
-        # Save 3D render if possible
+        # Save 3D render if possible (will be skipped on headless servers)
         save_3d_volume_render(
             final_track,
             intermediates_dir / "full_voxel_volume.png",
@@ -1504,7 +1603,7 @@ def main():
         print(f"Saved numpy array to: {npy_path}")
 
     if args.save_format in ["vti", "both"]:
-        if not PYVISTA_AVAILABLE or pv is None:
+        if not _check_pyvista_available():
             print("Warning: PyVista not available, skipping VTI file save")
         else:
             try:
