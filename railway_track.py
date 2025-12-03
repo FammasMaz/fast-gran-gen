@@ -542,31 +542,8 @@ def stitch_volumes_along_axis_with_inpainting(
 
     full_volume_pt = full_volume_pt.to(device)
 
-    # Save pre-inpainting volume (blocks placed with gaps, before inpainting fills the gaps)
-    if save_intermediates and intermediates_dir:
-        pre_inpaint_volume = pt_to_numpy(full_volume_pt.cpu())
-        stage_suffix = f"_{stitch_stage_name}" if stitch_stage_name else ""
-
-        # Save as NPZ
-        pre_inpaint_path = Path(intermediates_dir) / f"pre_inpainting{stage_suffix}.npz"
-        np.savez(pre_inpaint_path, volume=pre_inpaint_volume)
-        print(f"    Saved pre-inpainting volume to: {pre_inpaint_path}")
-
-        # Save as VTI for ParaView
-        pre_inpaint_vti_path = (
-            Path(intermediates_dir) / f"pre_inpainting{stage_suffix}.vti"
-        )
-        try:
-            save_vti_without_pyvista(pre_inpaint_volume, pre_inpaint_vti_path)
-        except Exception as e:
-            print(f"    Warning: Could not save pre-inpainting VTI: {e}")
-
-        # Save 2D slice visualization
-        save_intermediate_visualization(
-            pre_inpaint_volume,
-            Path(intermediates_dir) / f"pre_inpainting{stage_suffix}_slices.png",
-            title=f"Pre-Inpainting{stage_suffix} (blocks with gaps)",
-        )
+    # Note: Pre-inpainting save is now done at the full stack level in create_railway_track_3d
+    # (saves unified pre_inpainting_full_stack.vti with all strips placed with gaps)
 
     # Now perform inpainting at junction regions using batch optimization
     if inpainting_pipeline is not None:
@@ -778,19 +755,7 @@ def stitch_multiple_layers_with_cross_layer_batching(
 
         full_volume_pt = full_volume_pt.to(device)
 
-        # Save pre-inpainting volume for the first layer only (to avoid saving too many files)
-        if save_intermediates and intermediates_dir and layer_id == 0:
-            pre_inpaint_volume = pt_to_numpy(full_volume_pt.cpu())
-
-            # Save as VTI for ParaView - this shows strips placed with gaps before inpainting
-            pre_inpaint_vti_path = Path(intermediates_dir) / "pre_inpainting_width.vti"
-            try:
-                save_vti_without_pyvista(pre_inpaint_volume, pre_inpaint_vti_path)
-                print(
-                    f"    Saved pre-inpainting (width) volume to: {pre_inpaint_vti_path}"
-                )
-            except Exception as e:
-                print(f"    Warning: Could not save pre-inpainting VTI: {e}")
+        # Note: Pre-inpainting save is now done at the full stack level in create_railway_track_3d
 
         # Create junction information for this layer
         layer_junction_infos = []
@@ -1195,6 +1160,60 @@ def create_railway_track_3d(
         return None
 
     print(f"Successfully created {len(strips)} strips")
+
+    # Save full stack with gaps BEFORE any width/height inpainting
+    if save_intermediates and intermediates_dir and len(strips) > 0:
+        print("Assembling full stack with gaps (before width/height inpainting)...")
+
+        # Get dimensions from first strip
+        first_strip = strips[0]["volume"]
+        strip_shape = first_strip.shape  # (D, H_single, W_single) for a strip
+
+        # Calculate full volume dimensions with gaps
+        # Strips are arranged in a grid of (grids_width x grids_height)
+        gap_h = overlap_h if mask_type == "gap_filling_compatible" else 0
+        gap_w = overlap_w if mask_type == "gap_filling_compatible" else 0
+
+        # For gap-filling mode: total = n * size + (n-1) * gap
+        if mask_type == "gap_filling_compatible":
+            total_h = grids_width * strip_shape[1] + (grids_width - 1) * gap_h
+            total_w = grids_height * strip_shape[2] + (grids_height - 1) * gap_w
+        else:
+            # Overlapping mode
+            total_h = strip_shape[1] + (grids_width - 1) * (strip_shape[1] - overlap_h)
+            total_w = strip_shape[2] + (grids_height - 1) * (strip_shape[2] - overlap_w)
+
+        full_stack = np.zeros((strip_shape[0], total_h, total_w), dtype=np.float32)
+
+        # Place each strip in the full volume with gaps
+        for strip_data in strips:
+            j, k = strip_data["position"]  # width_idx, height_idx
+            volume = strip_data["volume"]
+
+            # Calculate position with gaps
+            if mask_type == "gap_filling_compatible":
+                h_start = j * (strip_shape[1] + gap_h)
+                w_start = k * (strip_shape[2] + gap_w)
+            else:
+                h_start = j * (strip_shape[1] - overlap_h)
+                w_start = k * (strip_shape[2] - overlap_w)
+
+            h_end = h_start + strip_shape[1]
+            w_end = w_start + strip_shape[2]
+
+            # Place the strip (use max to handle overlaps)
+            full_stack[:, h_start:h_end, w_start:w_end] = np.maximum(
+                full_stack[:, h_start:h_end, w_start:w_end], volume
+            )
+
+        # Save as VTI for ParaView
+        pre_inpaint_path = Path(intermediates_dir) / "pre_inpainting_full_stack.vti"
+        try:
+            save_vti_without_pyvista(full_stack, pre_inpaint_path)
+            print(f"  Saved full stack with gaps to: {pre_inpaint_path}")
+            print(f"  Shape: {full_stack.shape}")
+        except Exception as e:
+            print(f"  Warning: Could not save full stack VTI: {e}")
 
     # Step 2: Stitch strips along width dimension (H axis)
     print("Step 2: Stitching strips along width dimension...")
