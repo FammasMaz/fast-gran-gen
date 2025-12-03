@@ -15,8 +15,8 @@ from utils.eval_utils import (
 from modules.trainer import MaskGenerator3D
 
 # Try to import pyvista with xvfb for headless rendering
-# NOTE: On headless servers without X, PyVista can crash even with start_xvfb()
-# We defer the actual test until rendering time to avoid crashing at import
+# NOTE: On headless servers without X, PyVista causes a SEGFAULT (not catchable)
+# We check for DISPLAY environment variable first to avoid crashes
 PYVISTA_AVAILABLE = False
 pv = None
 
@@ -26,6 +26,15 @@ def _check_pyvista_available():
     global PYVISTA_AVAILABLE, pv
     if pv is not None:
         return PYVISTA_AVAILABLE
+
+    # Check if we're on a headless system (no DISPLAY)
+    display = os.environ.get("DISPLAY", "")
+    if not display:
+        print(
+            "Note: No DISPLAY environment variable set - skipping PyVista (headless server)"
+        )
+        PYVISTA_AVAILABLE = False
+        return False
 
     try:
         import pyvista as pv_module
@@ -1603,19 +1612,24 @@ def main():
         print(f"Saved numpy array to: {npy_path}")
 
     if args.save_format in ["vti", "both"]:
-        if not _check_pyvista_available():
-            print("Warning: PyVista not available, skipping VTI file save")
-        else:
-            try:
-                vti_path = output_dir / f"{base_name}.vti"
+        vti_path = output_dir / f"{base_name}.vti"
 
-                # Create VTK image data
+        # Try PyVista first (if available), otherwise use pure Python VTI writer
+        if _check_pyvista_available():
+            try:
                 vtk_data = pv.ImageData(dimensions=railway_track.shape)
                 vtk_data["voxel_data"] = railway_track.flatten(order="F")
                 vtk_data.save(vti_path)
                 print(f"Saved VTI file to: {vti_path}")
             except Exception as e:
-                print(f"Warning: Could not save VTI file: {e}")
+                print(
+                    f"Warning: PyVista VTI save failed ({e}), trying pure Python fallback..."
+                )
+                save_vti_without_pyvista(railway_track, vti_path)
+        else:
+            # Use pure Python VTI writer (no PyVista needed)
+            print("Using pure Python VTI writer (PyVista not available)")
+            save_vti_without_pyvista(railway_track, vti_path)
 
     # Print summary
     print("\n" + "=" * 50)
