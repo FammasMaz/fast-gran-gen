@@ -444,11 +444,19 @@ def stitch_volumes_along_axis_with_inpainting(
     seed,
     mask_type="gap_filling_compatible",
     inpaint_batch_size=20,
+    save_intermediates=False,
+    intermediates_dir=None,
+    stitch_stage_name="",
     **kwargs,
 ):
     """
     Stitch multiple volumes along a specified axis using gap-filling or overlapping logic.
     Now uses batch inpainting optimization for improved performance.
+
+    Args:
+        save_intermediates: If True, saves the pre-inpainting volume
+        intermediates_dir: Directory to save intermediate files
+        stitch_stage_name: Name suffix for intermediate files (e.g., "length", "width", "height")
     """
     if len(volumes) == 1:
         return volumes[0]
@@ -533,6 +541,32 @@ def stitch_volumes_along_axis_with_inpainting(
         current_pos += step
 
     full_volume_pt = full_volume_pt.to(device)
+
+    # Save pre-inpainting volume (blocks placed with gaps, before inpainting fills the gaps)
+    if save_intermediates and intermediates_dir:
+        pre_inpaint_volume = pt_to_numpy(full_volume_pt.cpu())
+        stage_suffix = f"_{stitch_stage_name}" if stitch_stage_name else ""
+
+        # Save as NPZ
+        pre_inpaint_path = Path(intermediates_dir) / f"pre_inpainting{stage_suffix}.npz"
+        np.savez(pre_inpaint_path, volume=pre_inpaint_volume)
+        print(f"    Saved pre-inpainting volume to: {pre_inpaint_path}")
+
+        # Save as VTI for ParaView
+        pre_inpaint_vti_path = (
+            Path(intermediates_dir) / f"pre_inpainting{stage_suffix}.vti"
+        )
+        try:
+            save_vti_without_pyvista(pre_inpaint_volume, pre_inpaint_vti_path)
+        except Exception as e:
+            print(f"    Warning: Could not save pre-inpainting VTI: {e}")
+
+        # Save 2D slice visualization
+        save_intermediate_visualization(
+            pre_inpaint_volume,
+            Path(intermediates_dir) / f"pre_inpainting{stage_suffix}_slices.png",
+            title=f"Pre-Inpainting{stage_suffix} (blocks with gaps)",
+        )
 
     # Now perform inpainting at junction regions using batch optimization
     if inpainting_pipeline is not None:
@@ -627,6 +661,8 @@ def stitch_multiple_layers_with_cross_layer_batching(
     seed,
     mask_type="gap_filling_compatible",
     max_batch_size=20,  # Maximum number of junctions to process in a single batch
+    save_intermediates=False,
+    intermediates_dir=None,
     **kwargs,
 ):
     """
@@ -741,6 +777,20 @@ def stitch_multiple_layers_with_cross_layer_batching(
             current_pos += step
 
         full_volume_pt = full_volume_pt.to(device)
+
+        # Save pre-inpainting volume for the first layer only (to avoid saving too many files)
+        if save_intermediates and intermediates_dir and layer_id == 0:
+            pre_inpaint_volume = pt_to_numpy(full_volume_pt.cpu())
+
+            # Save as VTI for ParaView - this shows strips placed with gaps before inpainting
+            pre_inpaint_vti_path = Path(intermediates_dir) / "pre_inpainting_width.vti"
+            try:
+                save_vti_without_pyvista(pre_inpaint_volume, pre_inpaint_vti_path)
+                print(
+                    f"    Saved pre-inpainting (width) volume to: {pre_inpaint_vti_path}"
+                )
+            except Exception as e:
+                print(f"    Warning: Could not save pre-inpainting VTI: {e}")
 
         # Create junction information for this layer
         layer_junction_infos = []
@@ -1176,6 +1226,8 @@ def create_railway_track_3d(
         seed=seed,
         mask_type=mask_type,
         max_batch_size=inpaint_batch_size,  # Use configurable batch size
+        save_intermediates=save_intermediates,
+        intermediates_dir=intermediates_dir,
         **kwargs,
     )
 
@@ -1195,6 +1247,9 @@ def create_railway_track_3d(
             seed=seed + 100000,
             mask_type=mask_type,
             inpaint_batch_size=inpaint_batch_size,
+            save_intermediates=save_intermediates,
+            intermediates_dir=intermediates_dir,
+            stitch_stage_name="height",
             **kwargs,
         )
 
