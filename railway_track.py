@@ -15,24 +15,50 @@ from utils.eval_utils import (
 from modules.trainer import MaskGenerator3D
 
 # Try to import pyvista with xvfb for headless rendering
+# NOTE: On headless servers without X, PyVista can crash even with start_xvfb()
+# We defer the actual test until rendering time to avoid crashing at import
 PYVISTA_AVAILABLE = False
 pv = None
-try:
-    import pyvista as pv_module
 
-    pv = pv_module
-    # Try to start virtual framebuffer for headless servers
+
+def _check_pyvista_available():
+    """Lazy check if PyVista can actually render (called on first use)."""
+    global PYVISTA_AVAILABLE, pv
+    if pv is not None:
+        return PYVISTA_AVAILABLE
+
     try:
-        pv.start_xvfb()
-        print("Started Xvfb virtual framebuffer for PyVista rendering")
-    except Exception as xvfb_err:
-        print(
-            f"Note: Could not start Xvfb ({xvfb_err}), PyVista 3D rendering may not work"
-        )
-    pv.OFF_SCREEN = True
-    PYVISTA_AVAILABLE = True
-except ImportError:
-    print("Note: PyVista not available, 3D renders will be skipped")
+        import pyvista as pv_module
+
+        pv_module.OFF_SCREEN = True
+
+        # Try to start virtual framebuffer
+        try:
+            pv_module.start_xvfb()
+            print("Started Xvfb virtual framebuffer for PyVista rendering")
+        except Exception:
+            pass  # May still work without xvfb on some systems
+
+        # Test if rendering actually works by creating a tiny test render
+        try:
+            test_plotter = pv_module.Plotter(off_screen=True, window_size=(100, 100))
+            test_plotter.add_mesh(pv_module.Sphere(radius=0.1))
+            test_plotter.close()
+            pv = pv_module
+            PYVISTA_AVAILABLE = True
+            print("PyVista 3D rendering available")
+        except Exception as render_err:
+            print(
+                f"Note: PyVista rendering test failed ({render_err}), 3D renders will be skipped"
+            )
+            PYVISTA_AVAILABLE = False
+
+    except ImportError:
+        print("Note: PyVista not installed, 3D renders will be skipped")
+        PYVISTA_AVAILABLE = False
+
+    return PYVISTA_AVAILABLE
+
 
 # Try to import matplotlib for visualization
 MPL_AVAILABLE = False
