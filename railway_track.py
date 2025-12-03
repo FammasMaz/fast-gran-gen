@@ -13,7 +13,26 @@ from utils.eval_utils import (
     pt_to_numpy,
 )
 from modules.trainer import MaskGenerator3D
-import pyvista as pv
+
+# Try to import pyvista with xvfb for headless rendering
+PYVISTA_AVAILABLE = False
+pv = None
+try:
+    import pyvista as pv_module
+
+    pv = pv_module
+    # Try to start virtual framebuffer for headless servers
+    try:
+        pv.start_xvfb()
+        print("Started Xvfb virtual framebuffer for PyVista rendering")
+    except Exception as xvfb_err:
+        print(
+            f"Note: Could not start Xvfb ({xvfb_err}), PyVista 3D rendering may not work"
+        )
+    pv.OFF_SCREEN = True
+    PYVISTA_AVAILABLE = True
+except ImportError:
+    print("Note: PyVista not available, 3D renders will be skipped")
 
 # Try to import matplotlib for visualization
 MPL_AVAILABLE = False
@@ -141,6 +160,10 @@ def save_blocks_visualization(blocks, output_path, max_blocks=6):
 
 def save_3d_volume_render(volume, output_path, title=""):
     """Save a 3D volume render using PyVista."""
+    if not PYVISTA_AVAILABLE or pv is None:
+        print(f"  Skipping 3D render (PyVista not available): {output_path}")
+        return False
+
     try:
         if isinstance(volume, torch.Tensor):
             volume = volume.cpu().numpy()
@@ -1455,16 +1478,19 @@ def main():
         print(f"Saved numpy array to: {npy_path}")
 
     if args.save_format in ["vti", "both"]:
-        try:
-            vti_path = output_dir / f"{base_name}.vti"
+        if not PYVISTA_AVAILABLE or pv is None:
+            print("Warning: PyVista not available, skipping VTI file save")
+        else:
+            try:
+                vti_path = output_dir / f"{base_name}.vti"
 
-            # Create VTK image data
-            vtk_data = pv.ImageData(dimensions=railway_track.shape)
-            vtk_data["voxel_data"] = railway_track.flatten(order="F")
-            vtk_data.save(vti_path)
-            print(f"Saved VTI file to: {vti_path}")
-        except Exception as e:
-            print(f"Warning: Could not save VTI file: {e}")
+                # Create VTK image data
+                vtk_data = pv.ImageData(dimensions=railway_track.shape)
+                vtk_data["voxel_data"] = railway_track.flatten(order="F")
+                vtk_data.save(vti_path)
+                print(f"Saved VTI file to: {vti_path}")
+            except Exception as e:
+                print(f"Warning: Could not save VTI file: {e}")
 
     # Print summary
     print("\n" + "=" * 50)
