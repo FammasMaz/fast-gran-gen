@@ -15,6 +15,177 @@ from utils.eval_utils import (
 from modules.trainer import MaskGenerator3D
 import pyvista as pv
 
+# Try to import matplotlib for visualization
+MPL_AVAILABLE = False
+plt = None
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")  # Non-interactive backend for server
+    import matplotlib.pyplot as plt_module
+    from mpl_toolkits.mplot3d import Axes3D
+
+    plt = plt_module
+    MPL_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def save_intermediate_visualization(data, output_path, title="", vmin=None, vmax=None):
+    """Save a 3D volume visualization as PNG using orthogonal slices."""
+    if not MPL_AVAILABLE:
+        print(
+            f"  Warning: matplotlib not available, skipping visualization: {output_path}"
+        )
+        return False
+
+    try:
+        if isinstance(data, torch.Tensor):
+            data = data.cpu().numpy()
+
+        # Remove batch/channel dimensions if present
+        while data.ndim > 3:
+            data = data[0]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        mid_x, mid_y, mid_z = data.shape[0] // 2, data.shape[1] // 2, data.shape[2] // 2
+
+        im0 = axes[0].imshow(
+            data[mid_x, :, :], cmap="YlOrBr", aspect="auto", vmin=vmin, vmax=vmax
+        )
+        axes[0].set_title(f"YZ slice (x={mid_x})")
+        axes[0].set_xlabel("Z")
+        axes[0].set_ylabel("Y")
+
+        im1 = axes[1].imshow(
+            data[:, mid_y, :], cmap="YlOrBr", aspect="auto", vmin=vmin, vmax=vmax
+        )
+        axes[1].set_title(f"XZ slice (y={mid_y})")
+        axes[1].set_xlabel("Z")
+        axes[1].set_ylabel("X")
+
+        im2 = axes[2].imshow(
+            data[:, :, mid_z], cmap="YlOrBr", aspect="auto", vmin=vmin, vmax=vmax
+        )
+        axes[2].set_title(f"XY slice (z={mid_z})")
+        axes[2].set_xlabel("Y")
+        axes[2].set_ylabel("X")
+
+        fig.colorbar(im2, ax=axes, shrink=0.6, label="Voxel Value")
+
+        if title:
+            fig.suptitle(title, fontsize=14, fontweight="bold")
+
+        plt.tight_layout()
+        plt.savefig(str(output_path), dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close()
+        print(f"  Saved visualization: {output_path}")
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not save visualization {output_path}: {e}")
+        return False
+
+
+def save_blocks_visualization(blocks, output_path, max_blocks=6):
+    """Save visualization of multiple voxel blocks side-by-side."""
+    if not MPL_AVAILABLE:
+        print(f"  Warning: matplotlib not available, skipping blocks visualization")
+        return False
+
+    try:
+        n_blocks = min(len(blocks), max_blocks)
+        fig, axes = plt.subplots(2, n_blocks, figsize=(4 * n_blocks, 8))
+
+        colors = ["#4ECDC4", "#FF6B6B", "#45B7D1", "#96CEB4", "#FFEAA7", "#DDA0DD"]
+
+        for i in range(n_blocks):
+            block = blocks[i]
+            if isinstance(block, torch.Tensor):
+                block = block.cpu().numpy()
+            while block.ndim > 3:
+                block = block[0]
+
+            # Top row: XY slice (top-down view)
+            mid_z = block.shape[2] // 2
+            axes[0, i].imshow(block[:, :, mid_z], cmap="YlOrBr", aspect="auto")
+            axes[0, i].set_title(f"Block {i + 1}\nXY slice", fontsize=10)
+            axes[0, i].axis("off")
+
+            # Bottom row: XZ slice (side view)
+            mid_y = block.shape[1] // 2
+            axes[1, i].imshow(block[:, mid_y, :], cmap="YlOrBr", aspect="auto")
+            axes[1, i].set_title(f"XZ slice", fontsize=10)
+            axes[1, i].axis("off")
+
+        # Hide unused axes
+        for i in range(n_blocks, len(blocks)):
+            if i < axes.shape[1]:
+                axes[0, i].axis("off")
+                axes[1, i].axis("off")
+
+        fig.suptitle(
+            f"Sampled Voxel Blocks (showing {n_blocks}/{len(blocks)})",
+            fontsize=14,
+            fontweight="bold",
+        )
+        plt.tight_layout()
+        plt.savefig(str(output_path), dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close()
+        print(f"  Saved blocks visualization: {output_path}")
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not save blocks visualization: {e}")
+        return False
+
+
+def save_3d_volume_render(volume, output_path, title=""):
+    """Save a 3D volume render using PyVista."""
+    try:
+        if isinstance(volume, torch.Tensor):
+            volume = volume.cpu().numpy()
+        while volume.ndim > 3:
+            volume = volume[0]
+
+        # Create VTK image data
+        grid = pv.ImageData(dimensions=np.array(volume.shape) + 1)
+        grid.cell_data["values"] = volume.flatten(order="F")
+
+        # Threshold to show only occupied voxels
+        threshed = grid.threshold(0.5, scalars="values")
+
+        if threshed.n_cells == 0:
+            print(f"  Warning: No voxels above threshold for {output_path}")
+            return False
+
+        plotter = pv.Plotter(off_screen=True, window_size=(1200, 900))
+        plotter.set_background("white")
+
+        plotter.add_mesh(
+            threshed,
+            cmap="YlOrBr",
+            opacity=0.7,
+            show_edges=False,
+            show_scalar_bar=False,
+        )
+        plotter.add_mesh(grid.outline(), color="gray", line_width=2)
+
+        if title:
+            plotter.add_text(title, position="upper_left", font_size=12, color="black")
+
+        plotter.camera_position = "iso"
+        plotter.camera.azimuth = 30
+        plotter.camera.elevation = 20
+        plotter.camera.zoom(0.9)
+
+        plotter.screenshot(str(output_path))
+        plotter.close()
+        print(f"  Saved 3D render: {output_path}")
+        return True
+    except Exception as e:
+        print(f"  Warning: Could not save 3D render {output_path}: {e}")
+        return False
+
 
 def load_models(model_path, inpainting_model_path, scheduler_type="ddim"):
     """
@@ -35,12 +206,19 @@ def load_models(model_path, inpainting_model_path, scheduler_type="ddim"):
         print(f"Base pipeline loaded with {scheduler_type.upper()} scheduler.")
 
         # Apply workaround if needed
-        if hasattr(unet, "_original_in_channels") and "_original_in_channels" not in unet.config:
+        if (
+            hasattr(unet, "_original_in_channels")
+            and "_original_in_channels" not in unet.config
+        ):
             try:
                 unet.config["_original_in_channels"] = unet._original_in_channels
-                print("Applied workaround: Added '_original_in_channels' to unet.config")
+                print(
+                    "Applied workaround: Added '_original_in_channels' to unet.config"
+                )
             except TypeError:
-                print("Warning: Could not directly add attribute to unet.config (FrozenDict is immutable).")
+                print(
+                    "Warning: Could not directly add attribute to unet.config (FrozenDict is immutable)."
+                )
 
     except Exception as e:
         print(f"Error loading BASE pipeline: {e}")
@@ -52,7 +230,9 @@ def load_models(model_path, inpainting_model_path, scheduler_type="ddim"):
         inpainting_model_path = Path(inpainting_model_path)
         print(f"Loading INPAINTING diffusion pipeline from: {inpainting_model_path}")
         try:
-            inpainting_pipeline = DiffusionPipeline.from_pretrained(inpainting_model_path).to(device)
+            inpainting_pipeline = DiffusionPipeline.from_pretrained(
+                inpainting_model_path
+            ).to(device)
             print("Inpainting pipeline loaded successfully.")
         except Exception as e:
             print(f"Error loading INPAINTING pipeline: {e}")
@@ -131,7 +311,9 @@ def stitch_volumes_along_axis_with_inpainting(
     if len(volumes) == 1:
         return volumes[0]
 
-    print(f"    Stitching {len(volumes)} volumes along axis {axis} with overlap/gap={overlap}")
+    print(
+        f"    Stitching {len(volumes)} volumes along axis {axis} with overlap/gap={overlap}"
+    )
 
     # Calculate dimensions
     first_vol = volumes[0]
@@ -144,12 +326,16 @@ def stitch_volumes_along_axis_with_inpainting(
         gap_size = overlap  # In gap mode, "overlap" parameter is actually gap size
         step = axis_size + gap_size  # Blocks are separated by gap_size
         total_axis_size = len(volumes) * axis_size + (len(volumes) - 1) * gap_size
-        print(f"    Gap-filling mode: gap_size={gap_size}, step={step}, total={total_axis_size}")
+        print(
+            f"    Gap-filling mode: gap_size={gap_size}, step={step}, total={total_axis_size}"
+        )
     else:
         # Overlapping mode: blocks overlap and seams are inpainted
         step = axis_size - overlap
         total_axis_size = axis_size + (len(volumes) - 1) * step
-        print(f"    Overlapping mode: overlap={overlap}, step={step}, total={total_axis_size}")
+        print(
+            f"    Overlapping mode: overlap={overlap}, step={step}, total={total_axis_size}"
+        )
 
     print(f"    Axis {axis}: size={axis_size}, step={step}, total={total_axis_size}")
 
@@ -160,14 +346,20 @@ def stitch_volumes_along_axis_with_inpainting(
     # Convert to PyTorch tensors for inpainting
     C = 1  # Assume single channel for now
     if len(vol_shape) == 3:
-        full_volume_pt = torch.zeros((1, C, *final_shape), dtype=torch.float32, device="cpu")
+        full_volume_pt = torch.zeros(
+            (1, C, *final_shape), dtype=torch.float32, device="cpu"
+        )
     else:
-        full_volume_pt = torch.zeros((1, *final_shape), dtype=torch.float32, device="cpu")
+        full_volume_pt = torch.zeros(
+            (1, *final_shape), dtype=torch.float32, device="cpu"
+        )
 
     # Place first volume
     first_vol_pt = numpy_to_pt(first_vol)
     if first_vol_pt.dim() == 3:
-        first_vol_pt = first_vol_pt.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+        first_vol_pt = first_vol_pt.unsqueeze(0).unsqueeze(
+            0
+        )  # Add batch and channel dims
     elif first_vol_pt.dim() == 4:
         first_vol_pt = first_vol_pt.unsqueeze(0)  # Add batch dim
 
@@ -207,50 +399,56 @@ def stitch_volumes_along_axis_with_inpainting(
         # Use the optimized batch inpainting function
         from utils.eval_utils import batch_inpaint_junctions
         import argparse
-        
+
         # Create junction information for batch inpainting
         junction_infos = []
         for i in range(len(volumes) - 1):
             if mask_type == "gap_filling_compatible":
                 # Gap-filling mode: inpaint the gaps between blocks
                 gap_size = overlap  # In gap mode, overlap parameter is gap size
-                gap_start = (i + 1) * axis_size + i * gap_size  # End of previous block + previous gaps
+                gap_start = (
+                    i + 1
+                ) * axis_size + i * gap_size  # End of previous block + previous gaps
                 gap_center = gap_start + gap_size // 2
-                
+
                 # Define processing region around gap
                 process_region_size = max(gap_size * 3, 16)  # Ensure sufficient context
                 region_start = max(0, gap_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-                
-                junction_infos.append({
-                    'junction_idx': i,
-                    'region_start_d': region_start,
-                    'region_end_d': region_end,
-                    'junction_center_d': gap_center,
-                    'region_depth': region_end - region_start,
-                    'gap_size': gap_size,
-                })
+
+                junction_infos.append(
+                    {
+                        "junction_idx": i,
+                        "region_start_d": region_start,
+                        "region_end_d": region_end,
+                        "junction_center_d": gap_center,
+                        "region_depth": region_end - region_start,
+                        "gap_size": gap_size,
+                    }
+                )
             else:
                 # Overlapping mode: inpaint the overlapping regions
                 junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
                 process_region_size = max(overlap * 3, 16)
                 region_start = max(0, junction_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-                
-                junction_infos.append({
-                    'junction_idx': i,
-                    'region_start_d': region_start,
-                    'region_end_d': region_end,
-                    'junction_center_d': junction_center,
-                    'region_depth': region_end - region_start,
-                    'gap_size': 0,  # No gap in overlapping mode
-                })
-        
+
+                junction_infos.append(
+                    {
+                        "junction_idx": i,
+                        "region_start_d": region_start,
+                        "region_end_d": region_end,
+                        "junction_center_d": junction_center,
+                        "region_depth": region_end - region_start,
+                        "gap_size": 0,  # No gap in overlapping mode
+                    }
+                )
+
         # Create dummy args for batch inpainting
         dummy_args = argparse.Namespace(
             mask_type=mask_type,
         )
-        
+
         # Apply batch inpainting
         batch_inpaint_junctions(
             full_volume_pt=full_volume_pt,
@@ -268,13 +466,14 @@ def stitch_volumes_along_axis_with_inpainting(
             axis=axis,  # Pass the axis parameter
             max_batch_size=inpaint_batch_size,  # Use configurable batch size
         )
-    
+
     # Convert back to numpy
     result_np = pt_to_numpy(full_volume_pt[0])
     if result_np.shape[0] == 1:  # Remove channel dimension if single channel
         result_np = result_np.squeeze(0)
 
     return result_np
+
 
 def stitch_multiple_layers_with_cross_layer_batching(
     height_layers,
@@ -290,10 +489,10 @@ def stitch_multiple_layers_with_cross_layer_batching(
 ):
     """
     Stitch multiple layers along a specified axis using true cross-layer batch inpainting.
-    
+
     This function processes multiple height layers simultaneously, collecting all junctions
     from all layers and processing them in larger batches across layers for maximum efficiency.
-    
+
     Args:
         height_layers: Dict mapping layer_id -> [(width_idx, volume), ...]
         axis: Axis along which to stitch (1 for width dimension)
@@ -305,37 +504,36 @@ def stitch_multiple_layers_with_cross_layer_batching(
         mask_type: Type of masking to use
         max_batch_size: Maximum junctions to process in a single batch
         **kwargs: Additional arguments
-    
+
     Returns:
         List of stitched layers
     """
-    print(f"    Cross-layer batching: Processing {len(height_layers)} layers with shared junction batching")
-    
+    print(
+        f"    Cross-layer batching: Processing {len(height_layers)} layers with shared junction batching"
+    )
+
     # Step 1: Set up all layer structures simultaneously
     layer_data = {}
     all_junction_tasks = []  # List of (layer_id, junction_info) tuples
-    
+
     print(f"      Setting up all layer structures...")
     for layer_id, width_strips in height_layers.items():
         # Sort strips by width position
         width_strips = sorted(width_strips, key=lambda x: x[0])
-        
+
         if len(width_strips) == 1:
             # Only one strip in this layer - no junctions needed
-            layer_data[layer_id] = {
-                'volume': width_strips[0][1],
-                'junction_infos': []
-            }
+            layer_data[layer_id] = {"volume": width_strips[0][1], "junction_infos": []}
             continue
-            
+
         # Create the volume structure (same as stitch_volumes_along_axis_with_inpainting)
         volumes = [strip[1] for strip in width_strips]
-        
+
         # Calculate dimensions
         first_vol = volumes[0]
         vol_shape = list(first_vol.shape)
         axis_size = vol_shape[axis]
-        
+
         # Calculate total size with gap-filling logic
         if mask_type == "gap_filling_compatible":
             gap_size = overlap
@@ -344,54 +542,64 @@ def stitch_multiple_layers_with_cross_layer_batching(
         else:
             step = axis_size - overlap
             total_axis_size = axis_size + (len(volumes) - 1) * step
-        
+
         # Create output volume and place volumes with gaps or overlaps
         final_shape = vol_shape.copy()
         final_shape[axis] = total_axis_size
-        
+
         # Convert to PyTorch tensors
         C = 1
         if len(vol_shape) == 3:
-            full_volume_pt = torch.zeros((1, C, *final_shape), dtype=torch.float32, device="cpu")
+            full_volume_pt = torch.zeros(
+                (1, C, *final_shape), dtype=torch.float32, device="cpu"
+            )
         else:
-            full_volume_pt = torch.zeros((1, *final_shape), dtype=torch.float32, device="cpu")
-        
+            full_volume_pt = torch.zeros(
+                (1, *final_shape), dtype=torch.float32, device="cpu"
+            )
+
         # Place first volume
         first_vol_pt = numpy_to_pt(first_vol)
         if first_vol_pt.dim() == 3:
             first_vol_pt = first_vol_pt.unsqueeze(0).unsqueeze(0)
         elif first_vol_pt.dim() == 4:
             first_vol_pt = first_vol_pt.unsqueeze(0)
-        
+
         if axis == 0:
-            full_volume_pt[0, :, :axis_size, :, :] = first_vol_pt[0, :, :axis_size, :, :]
+            full_volume_pt[0, :, :axis_size, :, :] = first_vol_pt[
+                0, :, :axis_size, :, :
+            ]
         elif axis == 1:
-            full_volume_pt[0, :, :, :axis_size, :] = first_vol_pt[0, :, :, :axis_size, :]
+            full_volume_pt[0, :, :, :axis_size, :] = first_vol_pt[
+                0, :, :, :axis_size, :
+            ]
         elif axis == 2:
-            full_volume_pt[0, :, :, :, :axis_size] = first_vol_pt[0, :, :, :, :axis_size]
-        
+            full_volume_pt[0, :, :, :, :axis_size] = first_vol_pt[
+                0, :, :, :, :axis_size
+            ]
+
         # Place subsequent volumes
         current_pos = step
         for i, volume in enumerate(volumes[1:], 1):
             end_pos = current_pos + axis_size
-            
+
             vol_pt = numpy_to_pt(volume)
             if vol_pt.dim() == 3:
                 vol_pt = vol_pt.unsqueeze(0).unsqueeze(0)
             elif vol_pt.dim() == 4:
                 vol_pt = vol_pt.unsqueeze(0)
-            
+
             if axis == 0:
                 full_volume_pt[0, :, current_pos:end_pos, :, :] = vol_pt[0, :, :, :, :]
             elif axis == 1:
                 full_volume_pt[0, :, :, current_pos:end_pos, :] = vol_pt[0, :, :, :, :]
             elif axis == 2:
                 full_volume_pt[0, :, :, :, current_pos:end_pos] = vol_pt[0, :, :, :, :]
-            
+
             current_pos += step
-        
+
         full_volume_pt = full_volume_pt.to(device)
-        
+
         # Create junction information for this layer
         layer_junction_infos = []
         for i in range(len(volumes) - 1):
@@ -402,71 +610,75 @@ def stitch_multiple_layers_with_cross_layer_batching(
                 process_region_size = max(gap_size * 3, 16)
                 region_start = max(0, gap_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-                
+
                 junction_info = {
-                    'junction_idx': i,
-                    'region_start_d': region_start,
-                    'region_end_d': region_end,
-                    'junction_center_d': gap_center,
-                    'region_depth': region_end - region_start,
-                    'gap_size': gap_size,
+                    "junction_idx": i,
+                    "region_start_d": region_start,
+                    "region_end_d": region_end,
+                    "junction_center_d": gap_center,
+                    "region_depth": region_end - region_start,
+                    "gap_size": gap_size,
                 }
             else:
                 junction_center = (i + 1) * axis_size - i * overlap - overlap // 2
                 process_region_size = max(overlap * 3, 16)
                 region_start = max(0, junction_center - process_region_size // 2)
                 region_end = min(total_axis_size, region_start + process_region_size)
-                
+
                 junction_info = {
-                    'junction_idx': i,
-                    'region_start_d': region_start,
-                    'region_end_d': region_end,
-                    'junction_center_d': junction_center,
-                    'region_depth': region_end - region_start,
-                    'gap_size': 0,
+                    "junction_idx": i,
+                    "region_start_d": region_start,
+                    "region_end_d": region_end,
+                    "junction_center_d": junction_center,
+                    "region_depth": region_end - region_start,
+                    "gap_size": 0,
                 }
-            
+
             layer_junction_infos.append(junction_info)
             # Add to global task list with layer reference
             all_junction_tasks.append((layer_id, junction_info))
-        
+
         layer_data[layer_id] = {
-            'volume': full_volume_pt,
-            'junction_infos': layer_junction_infos
+            "volume": full_volume_pt,
+            "junction_infos": layer_junction_infos,
         }
-    
+
     # Step 2: Process all junctions across layers in optimal batches
     if inpainting_pipeline is not None and all_junction_tasks:
         total_junctions = len(all_junction_tasks)
-        print(f"    Processing {total_junctions} junctions across {len(height_layers)} layers in optimized batches...")
-        
+        print(
+            f"    Processing {total_junctions} junctions across {len(height_layers)} layers in optimized batches..."
+        )
+
         from utils.eval_utils import batch_inpaint_junctions
         import argparse
-        
+
         # Create dummy args for batch inpainting
         dummy_args = argparse.Namespace(
             mask_type=mask_type,
         )
-        
+
         # Group tasks by layer and process in larger batches
         layer_tasks = {}
         for layer_id, junction_info in all_junction_tasks:
             if layer_id not in layer_tasks:
                 layer_tasks[layer_id] = []
             layer_tasks[layer_id].append(junction_info)
-        
+
         # Process layers in batches to maximize GPU utilization
         layer_ids = list(layer_tasks.keys())
         processed_layers = 0
-        
+
         for layer_id in layer_ids:
             junction_infos = layer_tasks[layer_id]
-            
+
             if junction_infos:
-                print(f"      Processing {len(junction_infos)} junctions for layer {layer_id}")
-                
+                print(
+                    f"      Processing {len(junction_infos)} junctions for layer {layer_id}"
+                )
+
                 batch_inpaint_junctions(
-                    full_volume_pt=layer_data[layer_id]['volume'],
+                    full_volume_pt=layer_data[layer_id]["volume"],
                     junction_infos=junction_infos,
                     inpainting_pipeline=inpainting_pipeline,
                     num_inference_steps=inference_steps,
@@ -481,26 +693,28 @@ def stitch_multiple_layers_with_cross_layer_batching(
                     axis=axis,
                     max_batch_size=max_batch_size,  # Use configurable batch size
                 )
-                
+
                 processed_layers += 1
-        
-        print(f"    Processed {processed_layers} layers with {total_junctions} total junctions")
-    
+
+        print(
+            f"    Processed {processed_layers} layers with {total_junctions} total junctions"
+        )
+
     # Step 3: Convert results back to numpy and return
     stitched_layers = []
     for layer_id in sorted(layer_data.keys()):
         layer_info = layer_data[layer_id]
-        
-        if isinstance(layer_info['volume'], torch.Tensor):
+
+        if isinstance(layer_info["volume"], torch.Tensor):
             # Convert tensor back to numpy
-            result_np = pt_to_numpy(layer_info['volume'][0])
+            result_np = pt_to_numpy(layer_info["volume"][0])
             if result_np.shape[0] == 1:
                 result_np = result_np.squeeze(0)
             stitched_layers.append(result_np)
         else:
             # Already numpy array
-            stitched_layers.append(layer_info['volume'])
-    
+            stitched_layers.append(layer_info["volume"])
+
     print(f"    Cross-layer batching completed for {len(stitched_layers)} layers")
     return stitched_layers
 
@@ -522,74 +736,89 @@ def create_strips_in_batches(
     binary,
     debug,
     strip_batch_size=4,
+    save_intermediates=False,
+    intermediates_dir=None,
     **kwargs,
 ):
     """
     Create multiple strips in batches to leverage parallelization.
-    
+
     Args:
         strip_positions: List of (j, k) positions for strips to create
         strip_batch_size: Number of strips to process in parallel
+        save_intermediates: If True, saves sampled blocks for visualization
+        intermediates_dir: Directory to save intermediate outputs
         Other args: Same as create_railway_track_1d
-    
+
     Returns:
         List of strip dictionaries with volume and position
     """
     strips = []
     total_strips = len(strip_positions)
-    
+
+    # Track all sampled blocks for intermediate saving
+    all_sampled_blocks = [] if save_intermediates else None
+
     print(f"Creating {total_strips} strips in batches of {strip_batch_size}")
-    
+
     # Process strips in batches
     for batch_start in range(0, total_strips, strip_batch_size):
         batch_end = min(batch_start + strip_batch_size, total_strips)
         batch_positions = strip_positions[batch_start:batch_end]
         current_batch_size = len(batch_positions)
-        
-        print(f"  Processing strip batch {batch_start//strip_batch_size + 1}/{(total_strips + strip_batch_size - 1)//strip_batch_size} "
-              f"({current_batch_size} strips)")
-        
+
+        print(
+            f"  Processing strip batch {batch_start // strip_batch_size + 1}/{(total_strips + strip_batch_size - 1) // strip_batch_size} "
+            f"({current_batch_size} strips)"
+        )
+
         # Generate all blocks for this batch of strips simultaneously
         batch_strips = []
-        
+
         # Calculate total blocks needed for this batch
         total_blocks_needed = current_batch_size * grids_length
-        
+
         # Generate all blocks for all strips in this batch at once
-        print(f"    Generating {total_blocks_needed} blocks for {current_batch_size} strips in parallel...")
-        
+        print(
+            f"    Generating {total_blocks_needed} blocks for {current_batch_size} strips in parallel..."
+        )
+
         # Create a large batch with all blocks for all strips
         all_blocks = []
         all_block_seeds = []
-        
+
         for idx, (j, k) in enumerate(batch_positions):
             strip_seed = seed + j * 1000 + k * 100
-            
+
             # Generate seeds for each block in this strip
             for block_idx in range(grids_length):
                 block_seed = strip_seed + block_idx
                 all_block_seeds.append(block_seed)
-        
+
         # Generate all blocks in large batches
         from utils.eval_utils import generate_single_volume
         import argparse
-        
+
         # Create temporary args for block generation
         temp_args = argparse.Namespace(
             mask_type="none",  # Ensure unconditional generation for initial blocks
-            **{k: v for k, v in kwargs.items() if k != 'mask_type'}
+            **{k: v for k, v in kwargs.items() if k != "mask_type"},
         )
-        
+
         # Generate blocks in batches
-        effective_batch_size = min(batch_size * 2, total_blocks_needed)  # Use larger batch size
-        
+        effective_batch_size = min(
+            batch_size * 2, total_blocks_needed
+        )  # Use larger batch size
+
         for block_batch_start in range(0, total_blocks_needed, effective_batch_size):
-            block_batch_end = min(block_batch_start + effective_batch_size, total_blocks_needed)
+            block_batch_end = min(
+                block_batch_start + effective_batch_size, total_blocks_needed
+            )
             current_block_batch_size = block_batch_end - block_batch_start
-            
+
             # Use the first seed for this batch (we'll handle randomness differently)
             batch_seed = all_block_seeds[block_batch_start]
-            
+
             blocks_batch = generate_single_volume(
                 unet=unet,
                 scheduler=scheduler,
@@ -602,28 +831,52 @@ def create_strips_in_batches(
                 max_retries=0,
                 progress_callback=None,
             )
-            
+
             if blocks_batch:
                 all_blocks.extend(blocks_batch)
-        
+
         print(f"    Generated {len(all_blocks)} blocks total")
-        
+
+        # Save sampled blocks for intermediate visualization
+        if save_intermediates and intermediates_dir and len(all_blocks) > 0:
+            # Save first batch of blocks as NPZ
+            if batch_start == 0:  # Only save once for the first batch
+                print(f"    Saving sampled blocks for visualization...")
+                blocks_to_save = [
+                    b.cpu().numpy() if isinstance(b, torch.Tensor) else b
+                    for b in all_blocks[: min(12, len(all_blocks))]
+                ]
+                np.savez(
+                    intermediates_dir / "sampled_blocks.npz",
+                    blocks=np.array(blocks_to_save),
+                )
+                print(f"    Saved {len(blocks_to_save)} blocks to sampled_blocks.npz")
+
+                # Generate visualization
+                save_blocks_visualization(
+                    all_blocks[: min(6, len(all_blocks))],
+                    intermediates_dir / "voxel_blocks.png",
+                    max_blocks=6,
+                )
+
         # Now organize blocks into strips and perform inpainting for each strip
         block_idx = 0
         for idx, (j, k) in enumerate(batch_positions):
             strip_seed = seed + j * 1000 + k * 100
-            
-            print(f"    Creating strip {batch_start + idx + 1}/{total_strips} for position (width={j}, height={k}) with seed={strip_seed}")
-            
+
+            print(
+                f"    Creating strip {batch_start + idx + 1}/{total_strips} for position (width={j}, height={k}) with seed={strip_seed}"
+            )
+
             # Get blocks for this strip
-            strip_blocks = all_blocks[block_idx:block_idx + grids_length]
+            strip_blocks = all_blocks[block_idx : block_idx + grids_length]
             block_idx += grids_length
-            
+
             if len(strip_blocks) == grids_length:
                 # Create a single volume from pre-generated blocks
                 # Use the optimized stitching function that supports batch inpainting
                 from utils.eval_utils import stitch_blocks_with_batch_inpainting
-                
+
                 strip = stitch_blocks_with_batch_inpainting(
                     volumes=strip_blocks,
                     axis=0,  # Length axis
@@ -636,21 +889,27 @@ def create_strips_in_batches(
                     binary=binary,
                     debug=debug,
                 )
-                
+
                 if strip is not None:
-                    batch_strips.append({
-                        "volume": strip,
-                        "position": (j, k),  # width, height position
-                    })
+                    batch_strips.append(
+                        {
+                            "volume": strip,
+                            "position": (j, k),  # width, height position
+                        }
+                    )
                     print(f"      ✓ Strip completed. Shape: {strip.shape}")
                 else:
-                    print(f"      ✗ Warning: Failed to create strip at position ({j}, {k})")
+                    print(
+                        f"      ✗ Warning: Failed to create strip at position ({j}, {k})"
+                    )
             else:
-                print(f"      ✗ Warning: Not enough blocks generated for strip at position ({j}, {k})")
-        
+                print(
+                    f"      ✗ Warning: Not enough blocks generated for strip at position ({j}, {k})"
+                )
+
         strips.extend(batch_strips)
         print(f"    Batch completed. {len(batch_strips)} strips created successfully.")
-    
+
     return strips
 
 
@@ -676,6 +935,8 @@ def create_railway_track_3d(
     strip_batch_size=4,
     inpaint_batch_size=20,
     layer_batch_size=4,  # New parameter for height layer batching
+    save_intermediates=False,
+    intermediates_dir=None,
     **kwargs,
 ):
     """
@@ -685,20 +946,28 @@ def create_railway_track_3d(
     1. First create strips along length dimension (using batched approach)
     2. Then stitch strips along width dimension
     3. Finally stitch layers along height dimension
+
+    Args:
+        save_intermediates: If True, saves intermediate pipeline stages for paper figures.
+        intermediates_dir: Directory to save intermediate outputs.
     """
-    print(f"Creating 3D railway track: {grids_length}x{grids_width}x{grids_height} grids")
+    print(
+        f"Creating 3D railway track: {grids_length}x{grids_width}x{grids_height} grids"
+    )
     print(f"Overlaps: D={overlap_d}, H={overlap_h}, W={overlap_w}")
     print(f"Strip batch size: {strip_batch_size}")
+    if save_intermediates:
+        print(f"Saving intermediate outputs to: {intermediates_dir}")
 
     # Step 1: Create strips along length dimension (D axis) using batched approach
     print("Step 1: Creating length strips in batches...")
-    
+
     # Generate all strip positions
     strip_positions = []
     for j in range(grids_width):
         for k in range(grids_height):
             strip_positions.append((j, k))
-    
+
     # Create strips in batches
     strips = create_strips_in_batches(
         unet=unet,
@@ -716,6 +985,8 @@ def create_railway_track_3d(
         batch_size=batch_size,
         binary=binary,
         debug=debug,
+        save_intermediates=save_intermediates,
+        intermediates_dir=intermediates_dir,
         strip_batch_size=strip_batch_size,
         **kwargs,
     )
@@ -739,12 +1010,12 @@ def create_railway_track_3d(
 
     # Process multiple height layers in parallel batches
     height_layer_keys = sorted(height_layers.keys())
-    
+
     stitched_layers = []
     total_layers = len(height_layer_keys)
-    
+
     print(f"  Processing {total_layers} height layers using cross-layer batching")
-    
+
     # Use the cross-layer batching function for better performance
     stitched_layers = stitch_multiple_layers_with_cross_layer_batching(
         height_layers=height_layers,
@@ -783,6 +1054,31 @@ def create_railway_track_3d(
         final_track = (final_track > 0.5).astype(np.float32)
 
     print(f"Final 3D railway track shape: {final_track.shape}")
+
+    # Save stitched volume visualization if intermediates requested
+    if save_intermediates and intermediates_dir:
+        print("Saving stitched volume visualizations...")
+
+        # Save the stitched volume as NPZ
+        np.savez(intermediates_dir / "stitched_volume.npz", volume=final_track)
+        print(f"  Saved stitched volume to stitched_volume.npz")
+
+        # Save 2D slice visualization
+        save_intermediate_visualization(
+            final_track,
+            intermediates_dir / "stitched_volume_slices.png",
+            title=f"Stitched Volume ({final_track.shape[0]}x{final_track.shape[1]}x{final_track.shape[2]})",
+        )
+
+        # Save 3D render if possible
+        save_3d_volume_render(
+            final_track,
+            intermediates_dir / "full_voxel_volume.png",
+            title=f"Full Stitched Volume",
+        )
+
+        print(f"  Pipeline visualizations saved to: {intermediates_dir}")
+
     return final_track
 
 
@@ -791,7 +1087,11 @@ def create_railway_track(
     inpainting_model_path,
     output_dir,
     target_volume,  # (depth, width, length) in real units
-    base_volume=(0.1, 0.3, 0.3),  # Volume represented by a single (32, 64, 64) voxel grid
+    base_volume=(
+        0.1,
+        0.3,
+        0.3,
+    ),  # Volume represented by a single (32, 64, 64) voxel grid
     overlap_d=8,
     overlap_w=8,
     overlap_l=8,
@@ -799,15 +1099,29 @@ def create_railway_track(
     debug=False,
     strip_batch_size=4,
     inpaint_batch_size=20,
+    save_intermediates=False,
     **kwargs,
 ):
     """
     Main function to create railway track of specified dimensions.
     Loads models once and reuses them for efficiency.
+
+    Args:
+        save_intermediates: If True, saves intermediate pipeline stages and visualizations
+                           to output_dir/intermediates/ for paper figures.
     """
+    # Create intermediates directory if saving
+    intermediates_dir = None
+    if save_intermediates:
+        intermediates_dir = Path(output_dir) / "intermediates"
+        intermediates_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Intermediate outputs will be saved to: {intermediates_dir}")
+
     # Load models once
     print("Loading models...")
-    unet, scheduler, inpainting_pipeline, device = load_models(model_path, inpainting_model_path, scheduler_type)
+    unet, scheduler, inpainting_pipeline, device = load_models(
+        model_path, inpainting_model_path, scheduler_type
+    )
 
     if unet is None:
         print("Failed to load models")
@@ -830,7 +1144,13 @@ def create_railway_track(
         print("Single block case - using simple generation")
         args = argparse.Namespace(**kwargs)
         volumes = generate_single_volume(
-            unet, scheduler, kwargs.get("inference_steps", 60), kwargs.get("seed", 123), 1, device, args
+            unet,
+            scheduler,
+            kwargs.get("inference_steps", 60),
+            kwargs.get("seed", 123),
+            1,
+            device,
+            args,
         )
         return volumes[0] if volumes else None
 
@@ -867,6 +1187,8 @@ def create_railway_track(
             strip_batch_size=strip_batch_size,
             inpaint_batch_size=inpaint_batch_size,
             layer_batch_size=4,  # Default layer batch size
+            save_intermediates=save_intermediates,
+            intermediates_dir=intermediates_dir,
             **kwargs,
         )
 
@@ -877,41 +1199,98 @@ def main():
     )
 
     # Required model paths
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained diffusion model directory")
     parser.add_argument(
-        "--inpainting_model_path", type=str, default=None, help="Path to the dedicated inpainting model directory"
+        "--model_path",
+        type=str,
+        required=True,
+        help="Path to the trained diffusion model directory",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="railway_tracks", help="Output directory for saving railway track files"
+        "--inpainting_model_path",
+        type=str,
+        default=None,
+        help="Path to the dedicated inpainting model directory",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="railway_tracks",
+        help="Output directory for saving railway track files",
     )
 
     # Target dimensions
-    parser.add_argument("--target_depth", type=float, required=True, help="Target depth of railway track (real units)")
-    parser.add_argument("--target_width", type=float, required=True, help="Target width of railway track (real units)")
     parser.add_argument(
-        "--target_length", type=float, required=True, help="Target length of railway track (real units)"
+        "--target_depth",
+        type=float,
+        required=True,
+        help="Target depth of railway track (real units)",
+    )
+    parser.add_argument(
+        "--target_width",
+        type=float,
+        required=True,
+        help="Target width of railway track (real units)",
+    )
+    parser.add_argument(
+        "--target_length",
+        type=float,
+        required=True,
+        help="Target length of railway track (real units)",
     )
 
     # Base unit dimensions (defaults match your description)
     parser.add_argument(
-        "--base_depth", type=float, default=0.1, help="Depth represented by single voxel grid (default: 0.1)"
+        "--base_depth",
+        type=float,
+        default=0.1,
+        help="Depth represented by single voxel grid (default: 0.1)",
     )
     parser.add_argument(
-        "--base_width", type=float, default=0.3, help="Width represented by single voxel grid (default: 0.3)"
+        "--base_width",
+        type=float,
+        default=0.3,
+        help="Width represented by single voxel grid (default: 0.3)",
     )
     parser.add_argument(
-        "--base_length", type=float, default=0.3, help="Length represented by single voxel grid (default: 0.3)"
+        "--base_length",
+        type=float,
+        default=0.3,
+        help="Length represented by single voxel grid (default: 0.3)",
     )
 
     # Overlap/gap parameters
-    parser.add_argument("--overlap_d", type=int, default=8, help="Gap size along depth dimension (default: 8)")
-    parser.add_argument("--overlap_w", type=int, default=8, help="Gap size along width dimension (default: 8)")
-    parser.add_argument("--overlap_l", type=int, default=8, help="Gap size along length dimension (default: 8)")
+    parser.add_argument(
+        "--overlap_d",
+        type=int,
+        default=8,
+        help="Gap size along depth dimension (default: 8)",
+    )
+    parser.add_argument(
+        "--overlap_w",
+        type=int,
+        default=8,
+        help="Gap size along width dimension (default: 8)",
+    )
+    parser.add_argument(
+        "--overlap_l",
+        type=int,
+        default=8,
+        help="Gap size along length dimension (default: 8)",
+    )
 
     # Generation parameters
-    parser.add_argument("--scheduler_type", choices=["ddpm", "ddim"], default="ddim", help="Choose sampling scheduler")
-    parser.add_argument("--inference_steps", type=int, default=60, help="Number of inference steps")
-    parser.add_argument("--seed", type=int, default=123, help="Random seed for generation")
+    parser.add_argument(
+        "--scheduler_type",
+        choices=["ddpm", "ddim"],
+        default="ddim",
+        help="Choose sampling scheduler",
+    )
+    parser.add_argument(
+        "--inference_steps", type=int, default=60, help="Number of inference steps"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=123, help="Random seed for generation"
+    )
     parser.add_argument(
         "--stitching_mode",
         type=str,
@@ -937,10 +1316,24 @@ def main():
         ],
         help="Type of mask to use for inpainting mode",
     )
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation")
-    parser.add_argument("--strip_batch_size", type=int, default=4, help="Number of strips to process in parallel (default: 4)")
-    parser.add_argument("--inpaint_batch_size", type=int, default=20, help="Maximum batch size for inpainting junctions to avoid OOM (default: 20)")
-    parser.add_argument("--binary", action="store_true", help="Threshold output to binary mask (>0.5)")
+    parser.add_argument(
+        "--batch_size", type=int, default=1, help="Batch size for generation"
+    )
+    parser.add_argument(
+        "--strip_batch_size",
+        type=int,
+        default=4,
+        help="Number of strips to process in parallel (default: 4)",
+    )
+    parser.add_argument(
+        "--inpaint_batch_size",
+        type=int,
+        default=20,
+        help="Maximum batch size for inpainting junctions to avoid OOM (default: 20)",
+    )
+    parser.add_argument(
+        "--binary", action="store_true", help="Threshold output to binary mask (>0.5)"
+    )
 
     # Inpainting parameters
     parser.add_argument(
@@ -949,9 +1342,16 @@ def main():
         default=0.3,
         help="Size of inpainting region as ratio of process region",
     )
-    parser.add_argument("--inpaint_iteratively", action="store_true", help="Whether to inpaint in smaller iterations")
     parser.add_argument(
-        "--inpaint_iterations", type=int, default=3, help="Number of iterations for iterative inpainting"
+        "--inpaint_iteratively",
+        action="store_true",
+        help="Whether to inpaint in smaller iterations",
+    )
+    parser.add_argument(
+        "--inpaint_iterations",
+        type=int,
+        default=3,
+        help="Number of iterations for iterative inpainting",
     )
     parser.add_argument(
         "--threshold_value",
@@ -962,18 +1362,39 @@ def main():
 
     # Output format
     parser.add_argument(
-        "--save_format", choices=["vti", "npy", "both"], default="both", help="Format to save the railway track"
+        "--save_format",
+        choices=["vti", "npy", "both"],
+        default="both",
+        help="Format to save the railway track",
     )
     parser.add_argument(
-        "--output_name", type=str, default=None, help="Custom name for output file (default: auto-generated)"
+        "--output_name",
+        type=str,
+        default=None,
+        help="Custom name for output file (default: auto-generated)",
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug output (saves intermediate strips)")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output (saves intermediate strips)",
+    )
+    parser.add_argument(
+        "--save-intermediates",
+        action="store_true",
+        dest="save_intermediates",
+        help="Save intermediate pipeline stages (blocks, stitched volume) and visualizations for paper figures",
+    )
 
     args = parser.parse_args()
 
     # Validate inpainting model requirement
-    if args.stitching_mode == "separate_inpainting" and args.inpainting_model_path is None:
-        raise ValueError("--inpainting_model_path is required when using --stitching_mode separate_inpainting")
+    if (
+        args.stitching_mode == "separate_inpainting"
+        and args.inpainting_model_path is None
+    ):
+        raise ValueError(
+            "--inpainting_model_path is required when using --stitching_mode separate_inpainting"
+        )
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -1006,6 +1427,7 @@ def main():
         strip_batch_size=args.strip_batch_size,
         inpaint_batch_size=args.inpaint_batch_size,
         binary=args.binary,
+        save_intermediates=args.save_intermediates,
         inpaint_region_size_ratio=args.inpaint_region_size_ratio,
         inpaint_iteratively=args.inpaint_iteratively,
         inpaint_iterations=args.inpaint_iterations,
