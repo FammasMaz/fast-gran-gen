@@ -111,19 +111,31 @@ def save_vti_without_pyvista(data, output_path, spacing=(1.0, 1.0, 1.0)):
     nx, ny, nz = data.shape
     dx, dy, dz = spacing
 
+    # Check if data is too large for uint32 header (>4GB raw data)
+    raw_size = nx * ny * nz * 4  # 4 bytes per float32
+    if raw_size > 4294967295:  # uint32 max
+        print(f"  WARNING: Data too large for VTI format ({raw_size / 1e9:.2f} GB)")
+        print(f"  Saving as chunked VTI with UInt64 header...")
+        # Use uint64 header for large files
+        header_type = "UInt64"
+        header_dtype = np.uint64
+    else:
+        header_type = "UInt32"
+        header_dtype = np.uint32
+
     # Compress data with zlib
     raw_data = data.flatten(order="F").tobytes()
     compressed = zlib.compress(raw_data, level=6)
     encoded = base64.b64encode(compressed).decode("ascii")
 
-    # Header for compressed data (4 bytes each: num_blocks, block_size, last_block_size, compressed_size)
+    # Header for compressed data (4 or 8 bytes each: num_blocks, block_size, last_block_size, compressed_size)
     header = np.array(
-        [1, len(raw_data), len(raw_data), len(compressed)], dtype=np.uint32
+        [1, len(raw_data), len(raw_data), len(compressed)], dtype=header_dtype
     )
     header_encoded = base64.b64encode(header.tobytes()).decode("ascii")
 
     vti_content = f'''<?xml version="1.0"?>
-<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt32" compressor="vtkZLibDataCompressor">
+<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="{header_type}" compressor="vtkZLibDataCompressor">
   <ImageData WholeExtent="0 {nx} 0 {ny} 0 {nz}" Origin="0 0 0" Spacing="{dx} {dy} {dz}">
     <Piece Extent="0 {nx} 0 {ny} 0 {nz}">
       <PointData>
