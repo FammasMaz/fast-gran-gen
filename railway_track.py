@@ -753,7 +753,8 @@ def stitch_multiple_layers_with_cross_layer_batching(
 
             current_pos += step
 
-        full_volume_pt = full_volume_pt.to(device)
+        # NOTE: Keep volume on CPU here - will be moved to GPU only when processing
+        # This is critical for memory efficiency with many layers
 
         # Note: Pre-inpainting save is now done at the full stack level in create_railway_track_3d
 
@@ -796,15 +797,16 @@ def stitch_multiple_layers_with_cross_layer_batching(
             all_junction_tasks.append((layer_id, junction_info))
 
         layer_data[layer_id] = {
-            "volume": full_volume_pt,
+            "volume": full_volume_pt,  # Keep on CPU until processing
             "junction_infos": layer_junction_infos,
         }
 
-    # Step 2: Process all junctions across layers in optimal batches
+    # Step 2: Process layers ONE AT A TIME to avoid GPU OOM
+    # This is more memory efficient than loading all layers to GPU simultaneously
     if inpainting_pipeline is not None and all_junction_tasks:
         total_junctions = len(all_junction_tasks)
         print(
-            f"    Processing {total_junctions} junctions across {len(height_layers)} layers in optimized batches..."
+            f"    Processing {total_junctions} junctions across {len(height_layers)} layers (memory-efficient mode)..."
         )
 
         from utils.eval_utils import batch_inpaint_junctions
@@ -815,14 +817,14 @@ def stitch_multiple_layers_with_cross_layer_batching(
             mask_type=mask_type,
         )
 
-        # Group tasks by layer and process in larger batches
+        # Group tasks by layer
         layer_tasks = {}
         for layer_id, junction_info in all_junction_tasks:
             if layer_id not in layer_tasks:
                 layer_tasks[layer_id] = []
             layer_tasks[layer_id].append(junction_info)
 
-        # Process layers in batches to maximize GPU utilization
+        # Process layers ONE AT A TIME to minimize GPU memory usage
         layer_ids = list(layer_tasks.keys())
         processed_layers = 0
 
@@ -833,6 +835,12 @@ def stitch_multiple_layers_with_cross_layer_batching(
                 print(
                     f"      Processing {len(junction_infos)} junctions for layer {layer_id}"
                 )
+
+                # Move this layer's volume to GPU for processing
+                layer_volume = layer_data[layer_id]["volume"]
+                if not layer_volume.is_cuda:
+                    layer_volume = layer_volume.to(device)
+                    layer_data[layer_id]["volume"] = layer_volume
 
                 batch_inpaint_junctions(
                     full_volume_pt=layer_data[layer_id]["volume"],
@@ -848,8 +856,12 @@ def stitch_multiple_layers_with_cross_layer_batching(
                     inpaint_iterations=3,
                     inpaint_region_size_ratio=0.3,
                     axis=axis,
-                    max_batch_size=max_batch_size,  # Use configurable batch size
+                    max_batch_size=max_batch_size,
                 )
+
+                # Move back to CPU immediately after processing to free GPU memory
+                layer_data[layer_id]["volume"] = layer_data[layer_id]["volume"].cpu()
+                torch.cuda.empty_cache()
 
                 processed_layers += 1
 
@@ -992,6 +1004,9 @@ def create_strips_in_batches(
             if blocks_batch:
                 all_blocks.extend(blocks_batch)
 
+            # Clear GPU cache after each block batch to prevent accumulation
+            torch.cuda.empty_cache()
+
         print(f"    Generated {len(all_blocks)} blocks total")
 
         # Save sampled blocks for intermediate visualization
@@ -1074,7 +1089,354 @@ def create_strips_in_batches(
         strips.extend(batch_strips)
         print(f"    Batch completed. {len(batch_strips)} strips created successfully.")
 
+        # Clear memory after each strip batch to prevent accumulation
+        del all_blocks
+        del batch_strips
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
     return strips
+
+
+def create_railway_track_3d_chunked(
+    unet,
+    scheduler,
+    inpainting_pipeline,
+    device,
+    output_dir,
+    grids_length,
+    grids_width,
+    grids_height,
+    overlap_d=8,
+    overlap_h=8,
+    overlap_w=8,
+    inference_steps=60,
+    seed=123,
+    stitching_mode="separate_inpainting",
+    mask_type="gap_filling_compatible",
+    batch_size=1,
+    binary=False,
+    debug=False,
+    strip_batch_size=4,
+    inpaint_batch_size=20,
+    chunk_length=10,  # Number of length blocks per chunk
+    num_gpus=1,  # Number of GPUs to use for parallel processing
+    **kwargs,
+):
+    """
+    Memory-efficient chunked 3D railway track generation.
+
+    Processes the track in length chunks to avoid CUDA OOM for very long tracks.
+    Each chunk is processed independently and saved to disk, then optionally
+    stitched together at the end.
+
+    Args:
+        chunk_length: Number of length blocks to process per chunk (default: 10)
+                     For base_length=0.3m, chunk_length=10 means 3m chunks
+        num_gpus: Number of GPUs to use for parallel chunk processing (default: 1)
+    """
+    print(f"Creating 3D railway track (CHUNKED MODE): {grids_length}x{grids_width}x{grids_height} grids")
+    print(f"Chunk size: {chunk_length} length blocks per chunk")
+    print(f"Overlaps: D={overlap_d}, H={overlap_h}, W={overlap_w}")
+
+    output_dir = Path(output_dir)
+    chunks_dir = output_dir / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Calculate number of chunks needed
+    num_chunks = (grids_length + chunk_length - 1) // chunk_length
+    print(f"Will process {num_chunks} chunks")
+
+    # Detect available GPUs
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    effective_num_gpus = min(num_gpus, available_gpus, num_chunks)
+
+    if effective_num_gpus > 1:
+        print(f"Multi-GPU mode: Using {effective_num_gpus} GPUs for parallel chunk processing")
+        return _create_chunks_multi_gpu(
+            unet=unet,
+            scheduler=scheduler,
+            inpainting_pipeline=inpainting_pipeline,
+            output_dir=output_dir,
+            chunks_dir=chunks_dir,
+            grids_length=grids_length,
+            grids_width=grids_width,
+            grids_height=grids_height,
+            overlap_d=overlap_d,
+            overlap_h=overlap_h,
+            overlap_w=overlap_w,
+            inference_steps=inference_steps,
+            seed=seed,
+            stitching_mode=stitching_mode,
+            mask_type=mask_type,
+            batch_size=batch_size,
+            binary=binary,
+            debug=debug,
+            strip_batch_size=strip_batch_size,
+            inpaint_batch_size=inpaint_batch_size,
+            chunk_length=chunk_length,
+            num_chunks=num_chunks,
+            num_gpus=effective_num_gpus,
+            **kwargs,
+        )
+
+    # Single GPU mode (original implementation)
+    print(f"Single GPU mode: Processing chunks sequentially on {device}")
+    chunk_files = []
+
+    for chunk_idx in range(num_chunks):
+        chunk_start = chunk_idx * chunk_length
+        chunk_end = min(chunk_start + chunk_length, grids_length)
+        actual_chunk_length = chunk_end - chunk_start
+
+        print(f"\n{'='*60}")
+        print(f"Processing chunk {chunk_idx + 1}/{num_chunks}: blocks {chunk_start}-{chunk_end-1}")
+        print(f"{'='*60}")
+
+        # Adjust seed for this chunk to ensure reproducibility
+        chunk_seed = seed + chunk_idx * 100000
+
+        # Generate this chunk using the regular 3D function but with reduced length
+        chunk_track = create_railway_track_3d(
+            unet=unet,
+            scheduler=scheduler,
+            inpainting_pipeline=inpainting_pipeline,
+            device=device,
+            output_dir=output_dir / f"chunk_{chunk_idx:03d}",
+            grids_length=actual_chunk_length,
+            grids_width=grids_width,
+            grids_height=grids_height,
+            overlap_d=overlap_d,
+            overlap_h=overlap_h,
+            overlap_w=overlap_w,
+            inference_steps=inference_steps,
+            seed=chunk_seed,
+            stitching_mode=stitching_mode,
+            mask_type=mask_type,
+            batch_size=batch_size,
+            binary=binary,
+            debug=debug,
+            strip_batch_size=strip_batch_size,
+            inpaint_batch_size=inpaint_batch_size,
+            save_intermediates=False,  # Don't save intermediates for chunks
+            intermediates_dir=None,
+            **kwargs,
+        )
+
+        if chunk_track is None:
+            print(f"ERROR: Failed to generate chunk {chunk_idx}")
+            continue
+
+        # Save chunk to disk immediately to free memory
+        chunk_file = chunks_dir / f"chunk_{chunk_idx:03d}.npy"
+        np.save(chunk_file, chunk_track)
+        chunk_files.append(chunk_file)
+        print(f"Saved chunk {chunk_idx + 1}/{num_chunks} to {chunk_file} (shape: {chunk_track.shape})")
+
+        # Free memory
+        del chunk_track
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
+        print(f"Memory cleared after chunk {chunk_idx + 1}")
+
+    return _stitch_chunk_files(chunk_files, chunks_dir, binary)
+
+
+def _process_chunk_on_gpu(args):
+    """Worker function to process a single chunk on a specific GPU."""
+    (chunk_idx, gpu_id, chunk_length, grids_length, grids_width, grids_height,
+     overlap_d, overlap_h, overlap_w, inference_steps, seed, stitching_mode,
+     mask_type, batch_size, binary, debug, strip_batch_size, inpaint_batch_size,
+     output_dir, chunks_dir, model_path, inpainting_model_path, scheduler_type,
+     kwargs) = args
+
+    import torch
+    import numpy as np
+    from pathlib import Path
+
+    # Set this process to use the specified GPU
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+
+    print(f"[GPU {gpu_id}] Processing chunk {chunk_idx}")
+
+    # Load models on this GPU
+    from railway_track import load_models, create_railway_track_3d
+    unet, scheduler, inpainting_pipeline, _ = load_models(
+        model_path, inpainting_model_path, scheduler_type
+    )
+
+    # Move models to this GPU
+    unet = unet.to(device)
+    if inpainting_pipeline is not None:
+        inpainting_pipeline = inpainting_pipeline.to(device)
+
+    chunk_start = chunk_idx * chunk_length
+    chunk_end = min(chunk_start + chunk_length, grids_length)
+    actual_chunk_length = chunk_end - chunk_start
+    chunk_seed = seed + chunk_idx * 100000
+
+    output_dir = Path(output_dir)
+    chunks_dir = Path(chunks_dir)
+
+    try:
+        chunk_track = create_railway_track_3d(
+            unet=unet,
+            scheduler=scheduler,
+            inpainting_pipeline=inpainting_pipeline,
+            device=device,
+            output_dir=output_dir / f"chunk_{chunk_idx:03d}",
+            grids_length=actual_chunk_length,
+            grids_width=grids_width,
+            grids_height=grids_height,
+            overlap_d=overlap_d,
+            overlap_h=overlap_h,
+            overlap_w=overlap_w,
+            inference_steps=inference_steps,
+            seed=chunk_seed,
+            stitching_mode=stitching_mode,
+            mask_type=mask_type,
+            batch_size=batch_size,
+            binary=binary,
+            debug=debug,
+            strip_batch_size=strip_batch_size,
+            inpaint_batch_size=inpaint_batch_size,
+            save_intermediates=False,
+            intermediates_dir=None,
+            **kwargs,
+        )
+
+        if chunk_track is not None:
+            chunk_file = chunks_dir / f"chunk_{chunk_idx:03d}.npy"
+            np.save(chunk_file, chunk_track)
+            print(f"[GPU {gpu_id}] Saved chunk {chunk_idx} to {chunk_file}")
+            return str(chunk_file)
+        else:
+            print(f"[GPU {gpu_id}] ERROR: Failed to generate chunk {chunk_idx}")
+            return None
+    except Exception as e:
+        print(f"[GPU {gpu_id}] ERROR processing chunk {chunk_idx}: {e}")
+        return None
+    finally:
+        # Clean up
+        del unet, scheduler, inpainting_pipeline
+        torch.cuda.empty_cache()
+
+
+def _create_chunks_multi_gpu(
+    unet, scheduler, inpainting_pipeline, output_dir, chunks_dir,
+    grids_length, grids_width, grids_height,
+    overlap_d, overlap_h, overlap_w, inference_steps, seed,
+    stitching_mode, mask_type, batch_size, binary, debug,
+    strip_batch_size, inpaint_batch_size, chunk_length, num_chunks, num_gpus,
+    **kwargs
+):
+    """Process chunks in parallel across multiple GPUs."""
+    import torch.multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # Get model paths from kwargs or use defaults
+    model_path = kwargs.get('model_path', None)
+    inpainting_model_path = kwargs.get('inpainting_model_path', None)
+    scheduler_type = kwargs.get('scheduler_type', 'ddim')
+
+    if model_path is None:
+        print("WARNING: model_path not provided for multi-GPU mode, falling back to single GPU")
+        # Fall back to single GPU - can't reload models without path
+        return None
+
+    # Prepare arguments for each chunk
+    chunk_args = []
+    for chunk_idx in range(num_chunks):
+        gpu_id = chunk_idx % num_gpus  # Round-robin GPU assignment
+        args = (
+            chunk_idx, gpu_id, chunk_length, grids_length, grids_width, grids_height,
+            overlap_d, overlap_h, overlap_w, inference_steps, seed, stitching_mode,
+            mask_type, batch_size, binary, debug, strip_batch_size, inpaint_batch_size,
+            str(output_dir), str(chunks_dir), model_path, inpainting_model_path,
+            scheduler_type, kwargs
+        )
+        chunk_args.append(args)
+
+    print(f"Starting multi-GPU processing: {num_chunks} chunks on {num_gpus} GPUs")
+
+    # Use spawn method for CUDA compatibility
+    mp.set_start_method('spawn', force=True)
+
+    chunk_files = []
+    try:
+        with ProcessPoolExecutor(max_workers=num_gpus) as executor:
+            futures = {executor.submit(_process_chunk_on_gpu, args): args[0]
+                      for args in chunk_args}
+
+            for future in as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        chunk_files.append(Path(result))
+                        print(f"Chunk {chunk_idx} completed successfully")
+                except Exception as e:
+                    print(f"Chunk {chunk_idx} failed with error: {e}")
+
+    except Exception as e:
+        print(f"Multi-GPU processing failed: {e}")
+        print("Falling back to single GPU sequential processing...")
+        return None
+
+    # Sort chunk files by index to maintain order
+    chunk_files = sorted(chunk_files, key=lambda p: int(p.stem.split('_')[1]))
+
+    return _stitch_chunk_files(chunk_files, chunks_dir, binary)
+
+
+def _stitch_chunk_files(chunk_files, chunks_dir, binary):
+    """Stitch chunk files together into a single track."""
+    print(f"\n{'='*60}")
+    print(f"All {len(chunk_files)} chunks generated successfully")
+    print(f"Chunk files saved to: {chunks_dir}")
+    print(f"{'='*60}")
+
+    if len(chunk_files) == 0:
+        print("ERROR: No chunks were generated")
+        return None
+
+    if len(chunk_files) == 1:
+        return np.load(chunk_files[0])
+
+    print("\nAttempting to stitch chunks together...")
+    try:
+        stitched_track = None
+
+        for i, chunk_file in enumerate(chunk_files):
+            chunk = np.load(chunk_file)
+
+            if stitched_track is None:
+                stitched_track = chunk
+            else:
+                stitched_track = np.concatenate([stitched_track, chunk], axis=0)
+
+            del chunk
+
+            if i % 5 == 0:
+                import gc
+                gc.collect()
+
+        print(f"Successfully stitched all chunks. Final shape: {stitched_track.shape}")
+
+        if binary:
+            stitched_track = (stitched_track > 0.5).astype(np.float32)
+
+        return stitched_track
+
+    except MemoryError:
+        print("\nWARNING: Not enough memory to stitch all chunks together")
+        print(f"Chunks are saved individually in: {chunks_dir}")
+        print("You can process them separately or stitch them on a machine with more RAM")
+        return np.load(chunk_files[0])
 
 
 def create_railway_track_3d(
@@ -1331,6 +1693,9 @@ def create_railway_track(
     strip_batch_size=4,
     inpaint_batch_size=20,
     save_intermediates=False,
+    chunk_length=None,  # Number of length blocks per chunk (None = auto, 0 = disabled)
+    chunk_threshold=50,  # Auto-enable chunking when grids_depth exceeds this
+    num_gpus=1,  # Number of GPUs for parallel chunk processing
     **kwargs,
 ):
     """
@@ -1340,6 +1705,12 @@ def create_railway_track(
     Args:
         save_intermediates: If True, saves intermediate pipeline stages and visualizations
                            to output_dir/intermediates/ for paper figures.
+        chunk_length: Number of length blocks per chunk for memory-efficient generation.
+                     None = auto-detect based on track length
+                     0 = disabled (process entire track at once)
+                     >0 = use specified chunk size
+        chunk_threshold: When grids_depth exceeds this, automatically enable chunking.
+        num_gpus: Number of GPUs for parallel chunk processing. 0 = auto-detect all available.
     """
     # Create intermediates directory if saving
     intermediates_dir = None
@@ -1369,6 +1740,24 @@ def create_railway_track(
     print(f"Target volume: {target_volume}")
     print(f"Base volume per grid: {base_volume}")
     print(f"Grids needed: {grids_depth} x {grids_width} x {grids_length}")
+
+    # Determine if chunking should be used
+    use_chunking = False
+    effective_chunk_length = 10  # Default chunk size
+
+    if chunk_length is None:
+        # Auto-detect: enable chunking for long tracks
+        if grids_depth > chunk_threshold:
+            use_chunking = True
+            effective_chunk_length = min(20, max(10, grids_depth // 10))
+            print(f"Auto-enabling chunked mode for long track ({grids_depth} blocks > {chunk_threshold} threshold)")
+            print(f"Using chunk size: {effective_chunk_length} blocks")
+    elif chunk_length > 0:
+        use_chunking = True
+        effective_chunk_length = chunk_length
+        print(f"Chunked mode enabled with chunk size: {effective_chunk_length} blocks")
+    else:
+        print("Chunked mode disabled (chunk_length=0)")
 
     if grids_depth == 1 and grids_width == 1 and grids_length == 1:
         # Single block case
@@ -1400,28 +1789,60 @@ def create_railway_track(
             **kwargs,
         )
     else:
-        # 3D case
-        print("3D case - extending in multiple dimensions")
-        return create_railway_track_3d(
-            unet=unet,
-            scheduler=scheduler,
-            inpainting_pipeline=inpainting_pipeline,
-            device=device,
-            output_dir=output_dir,
-            grids_length=grids_depth,
-            grids_width=grids_width,
-            grids_height=grids_length,
-            overlap_d=overlap_d,
-            overlap_h=overlap_w,
-            overlap_w=overlap_l,
-            debug=debug,
-            strip_batch_size=strip_batch_size,
-            inpaint_batch_size=inpaint_batch_size,
-            layer_batch_size=4,  # Default layer batch size
-            save_intermediates=save_intermediates,
-            intermediates_dir=intermediates_dir,
-            **kwargs,
-        )
+        # 3D case - use chunked mode if enabled
+        if use_chunking:
+            print("3D case - using CHUNKED mode for memory efficiency")
+            # Auto-detect GPUs if num_gpus is 0
+            effective_num_gpus = num_gpus
+            if num_gpus == 0:
+                effective_num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                print(f"Auto-detected {effective_num_gpus} GPU(s)")
+
+            return create_railway_track_3d_chunked(
+                unet=unet,
+                scheduler=scheduler,
+                inpainting_pipeline=inpainting_pipeline,
+                device=device,
+                output_dir=output_dir,
+                grids_length=grids_depth,
+                grids_width=grids_width,
+                grids_height=grids_length,
+                overlap_d=overlap_d,
+                overlap_h=overlap_w,
+                overlap_w=overlap_l,
+                debug=debug,
+                strip_batch_size=strip_batch_size,
+                inpaint_batch_size=inpaint_batch_size,
+                chunk_length=effective_chunk_length,
+                num_gpus=effective_num_gpus,
+                # Pass model paths for multi-GPU mode to reload models
+                model_path=model_path,
+                inpainting_model_path=inpainting_model_path,
+                scheduler_type=scheduler_type,
+                **kwargs,
+            )
+        else:
+            print("3D case - extending in multiple dimensions")
+            return create_railway_track_3d(
+                unet=unet,
+                scheduler=scheduler,
+                inpainting_pipeline=inpainting_pipeline,
+                device=device,
+                output_dir=output_dir,
+                grids_length=grids_depth,
+                grids_width=grids_width,
+                grids_height=grids_length,
+                overlap_d=overlap_d,
+                overlap_h=overlap_w,
+                overlap_w=overlap_l,
+                debug=debug,
+                strip_batch_size=strip_batch_size,
+                inpaint_batch_size=inpaint_batch_size,
+                layer_batch_size=4,  # Default layer batch size
+                save_intermediates=save_intermediates,
+                intermediates_dir=intermediates_dir,
+                **kwargs,
+            )
 
 
 def main():
@@ -1566,6 +1987,36 @@ def main():
         "--binary", action="store_true", help="Threshold output to binary mask (>0.5)"
     )
 
+    # Memory management / Chunking parameters
+    parser.add_argument(
+        "--chunk_length",
+        type=int,
+        default=None,
+        help="Number of length blocks per chunk for memory-efficient generation. "
+             "None (default) = auto-detect based on track length, "
+             "0 = disabled (process entire track at once), "
+             ">0 = use specified chunk size. For 100m tracks, try 10-20.",
+    )
+    parser.add_argument(
+        "--chunk_threshold",
+        type=int,
+        default=50,
+        help="Auto-enable chunking when grids_depth exceeds this value (default: 50). "
+             "For base_depth=0.3m, 50 blocks = 15m track length.",
+    )
+    parser.add_argument(
+        "--no_chunking",
+        action="store_true",
+        help="Disable automatic chunking even for long tracks (may cause OOM)",
+    )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to use for parallel chunk processing (default: 1). "
+             "Set to 0 for auto-detect all available GPUs.",
+    )
+
     # Inpainting parameters
     parser.add_argument(
         "--inpaint_region_size_ratio",
@@ -1663,6 +2114,9 @@ def main():
         inpaint_iteratively=args.inpaint_iteratively,
         inpaint_iterations=args.inpaint_iterations,
         threshold_value=args.threshold_value,
+        chunk_length=0 if args.no_chunking else args.chunk_length,
+        chunk_threshold=args.chunk_threshold,
+        num_gpus=args.num_gpus,
     )
 
     end_time = time.time()
