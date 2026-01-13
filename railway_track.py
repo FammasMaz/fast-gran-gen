@@ -1754,15 +1754,17 @@ def create_railway_track(
     print(f"Grids needed: {grids_depth} x {grids_width} x {grids_length}")
 
     # Determine if chunking should be used
+    # Use the longest dimension for chunking decision
+    longest_dimension = max(grids_depth, grids_width, grids_length)
     use_chunking = False
     effective_chunk_length = 10  # Default chunk size
 
     if chunk_length is None:
         # Auto-detect: enable chunking for long tracks
-        if grids_depth > chunk_threshold:
+        if longest_dimension > chunk_threshold:
             use_chunking = True
-            effective_chunk_length = min(20, max(10, grids_depth // 10))
-            print(f"Auto-enabling chunked mode for long track ({grids_depth} blocks > {chunk_threshold} threshold)")
+            effective_chunk_length = min(20, max(10, longest_dimension // 10))
+            print(f"Auto-enabling chunked mode for long track ({longest_dimension} blocks > {chunk_threshold} threshold)")
             print(f"Using chunk size: {effective_chunk_length} blocks")
     elif chunk_length > 0:
         use_chunking = True
@@ -1816,9 +1818,9 @@ def create_railway_track(
                 inpainting_pipeline=inpainting_pipeline,
                 device=device,
                 output_dir=output_dir,
-                grids_length=grids_depth,
+                grids_length=grids_length,  # Chunk along the LONG dimension (e.g., 834 for 250m)
                 grids_width=grids_width,
-                grids_height=grids_length,
+                grids_height=grids_depth,   # Short dimension (e.g., 3 for 0.3m depth)
                 overlap_d=overlap_d,
                 overlap_h=overlap_w,
                 overlap_w=overlap_l,
