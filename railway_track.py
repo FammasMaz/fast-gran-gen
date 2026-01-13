@@ -1432,8 +1432,11 @@ def _stitch_chunk_files(chunk_files, chunks_dir, binary):
 
             if stitched_track is None:
                 stitched_track = chunk
+                print(f"First chunk shape: {chunk.shape}")
             else:
-                stitched_track = np.concatenate([stitched_track, chunk], axis=0)
+                # Concatenate along axis 2 (the length/track dimension)
+                # Chunks have shape (depth, width, chunk_length)
+                stitched_track = np.concatenate([stitched_track, chunk], axis=2)
 
             del chunk
 
