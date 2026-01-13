@@ -1210,15 +1210,17 @@ def create_railway_track_3d_chunked(
         chunk_seed = seed + chunk_idx * 100000
 
         # Generate this chunk using the regular 3D function but with reduced length
+        # IMPORTANT: Swap dimensions back because create_railway_track_3d expects
+        # grids_length=short dimension (depth), grids_height=long dimension (length)
         chunk_track = create_railway_track_3d(
             unet=unet,
             scheduler=scheduler,
             inpainting_pipeline=inpainting_pipeline,
             device=device,
             output_dir=output_dir / f"chunk_{chunk_idx:03d}",
-            grids_length=actual_chunk_length,
-            grids_width=grids_width,
-            grids_height=grids_height,
+            grids_length=grids_height,        # Short dimension (e.g., 3 for depth)
+            grids_width=grids_width,          # Width dimension (e.g., 6)
+            grids_height=actual_chunk_length, # Chunk of long dimension (e.g., 20)
             overlap_d=overlap_d,
             overlap_h=overlap_h,
             overlap_w=overlap_w,
@@ -1295,15 +1297,17 @@ def _process_chunk_on_gpu(args):
     chunks_dir = Path(chunks_dir)
 
     try:
+        # IMPORTANT: Swap dimensions back because create_railway_track_3d expects
+        # grids_length=short dimension (depth), grids_height=long dimension (length)
         chunk_track = create_railway_track_3d(
             unet=unet,
             scheduler=scheduler,
             inpainting_pipeline=inpainting_pipeline,
             device=device,
             output_dir=output_dir / f"chunk_{chunk_idx:03d}",
-            grids_length=actual_chunk_length,
-            grids_width=grids_width,
-            grids_height=grids_height,
+            grids_length=grids_height,        # Short dimension (e.g., 3 for depth)
+            grids_width=grids_width,          # Width dimension (e.g., 6)
+            grids_height=actual_chunk_length, # Chunk of long dimension (e.g., 20)
             overlap_d=overlap_d,
             overlap_h=overlap_h,
             overlap_w=overlap_w,
