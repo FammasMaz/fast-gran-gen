@@ -1256,7 +1256,18 @@ def create_railway_track_3d_chunked(
 
         print(f"Memory cleared after chunk {chunk_idx + 1}")
 
-    return _stitch_chunk_files(chunk_files, chunks_dir, binary)
+    return _stitch_chunk_files(
+        chunk_files=chunk_files,
+        chunks_dir=chunks_dir,
+        binary=binary,
+        inpainting_pipeline=inpainting_pipeline,
+        device=device,
+        inference_steps=inference_steps,
+        seed=seed,
+        gap_size=overlap_d,  # Use same gap size as block-level
+        mask_type=mask_type,
+        inpaint_batch_size=inpaint_batch_size,
+    )
 
 
 def _process_chunk_on_gpu(args):
@@ -1406,11 +1417,69 @@ def _create_chunks_multi_gpu(
     # Sort chunk files by index to maintain order
     chunk_files = sorted(chunk_files, key=lambda p: int(p.stem.split('_')[1]))
 
-    return _stitch_chunk_files(chunk_files, chunks_dir, binary)
+    # For multi-GPU mode, we need to determine which device to use for stitching inpainting
+    # Use the first available GPU (cuda:0) for the final stitching step
+    stitch_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    # Reload inpainting pipeline on the stitching device if needed
+    if inpainting_pipeline is not None:
+        # Move pipeline to stitch device if it's on a different device
+        try:
+            inpainting_pipeline = inpainting_pipeline.to(stitch_device)
+        except Exception as e:
+            print(f"Warning: Could not move inpainting pipeline to {stitch_device}: {e}")
+
+    return _stitch_chunk_files(
+        chunk_files=chunk_files,
+        chunks_dir=chunks_dir,
+        binary=binary,
+        inpainting_pipeline=inpainting_pipeline,
+        device=stitch_device,
+        inference_steps=inference_steps,
+        seed=seed,
+        gap_size=overlap_d,  # Use same gap size as block-level
+        mask_type=mask_type,
+        inpaint_batch_size=inpaint_batch_size,
+    )
 
 
-def _stitch_chunk_files(chunk_files, chunks_dir, binary):
-    """Stitch chunk files together into a single track."""
+def _stitch_chunk_files(
+    chunk_files,
+    chunks_dir,
+    binary,
+    inpainting_pipeline=None,
+    device=None,
+    inference_steps=60,
+    seed=123,
+    gap_size=8,
+    mask_type="gap_filling_compatible",
+    inpaint_batch_size=20,
+):
+    """
+    Stitch chunk files together into a single track with gap-filling inpainting.
+
+    Uses a MEMORY-EFFICIENT pairwise approach:
+    1. For each pair of adjacent chunks, load only those two chunks
+    2. Extract boundary regions (context from both sides + gap)
+    3. Inpaint just the small boundary region on GPU
+    4. Save the inpainted gap
+    5. Final assembly on CPU with numpy
+
+    This ensures GPU memory only needs to hold small boundary regions,
+    not the entire track volume.
+
+    Args:
+        chunk_files: List of paths to chunk .npy files
+        chunks_dir: Directory where chunks are stored
+        binary: Whether to threshold output to binary
+        inpainting_pipeline: Loaded inpainting pipeline for gap filling
+        device: GPU device for inpainting
+        inference_steps: Number of diffusion steps for inpainting
+        seed: Random seed for inpainting
+        gap_size: Size of gap between chunks (in voxels)
+        mask_type: Mask type for inpainting
+        inpaint_batch_size: Batch size for inpainting junctions
+    """
     print(f"\n{'='*60}")
     print(f"All {len(chunk_files)} chunks generated successfully")
     print(f"Chunk files saved to: {chunks_dir}")
@@ -1423,26 +1492,151 @@ def _stitch_chunk_files(chunk_files, chunks_dir, binary):
     if len(chunk_files) == 1:
         return np.load(chunk_files[0])
 
-    print("\nAttempting to stitch chunks together...")
+    print("\nStitching chunks with MEMORY-EFFICIENT pairwise gap-filling...")
+
+    num_boundaries = len(chunk_files) - 1
+    print(f"Processing {num_boundaries} chunk boundaries pairwise")
+
+    # Context size: how many voxels on each side of the gap to include
+    # This provides context for the inpainting model
+    context_size = max(gap_size * 2, 16)  # At least 2x gap size or 16 voxels
+
+    # We stitch along axis 2 (length dimension)
+    axis = 2
+
+    # Store inpainted gaps
+    inpainted_gaps = []
+
     try:
-        stitched_track = None
+        # Process each boundary pairwise (memory efficient)
+        for boundary_idx in range(num_boundaries):
+            print(f"\n  Processing boundary {boundary_idx + 1}/{num_boundaries}...")
+
+            # Load only the two adjacent chunks needed
+            chunk_i = np.load(chunk_files[boundary_idx])
+            chunk_i_plus_1 = np.load(chunk_files[boundary_idx + 1])
+
+            # Get dimensions
+            D, W, L_i = chunk_i.shape
+            _, _, L_i_plus_1 = chunk_i_plus_1.shape
+
+            # Extract boundary regions (just the parts near the junction)
+            # Take context_size voxels from end of chunk_i
+            # Take context_size voxels from start of chunk_i+1
+            actual_context_left = min(context_size, L_i)
+            actual_context_right = min(context_size, L_i_plus_1)
+
+            end_of_chunk_i = chunk_i[:, :, -actual_context_left:]
+            start_of_chunk_i_plus_1 = chunk_i_plus_1[:, :, :actual_context_right]
+
+            # Free the full chunks from memory
+            del chunk_i, chunk_i_plus_1
+            import gc
+            gc.collect()
+
+            # Create small boundary volume: [end_of_i][gap][start_of_i+1]
+            boundary_length = actual_context_left + gap_size + actual_context_right
+            boundary_volume = np.zeros((D, W, boundary_length), dtype=np.float32)
+
+            # Place the context regions with gap in between
+            boundary_volume[:, :, :actual_context_left] = end_of_chunk_i
+            # Gap is already zeros (in the middle)
+            boundary_volume[:, :, actual_context_left + gap_size:] = start_of_chunk_i_plus_1
+
+            del end_of_chunk_i, start_of_chunk_i_plus_1
+            gc.collect()
+
+            print(f"    Boundary volume shape: {boundary_volume.shape} (context={actual_context_left}+{actual_context_right}, gap={gap_size})")
+
+            # Apply inpainting to fill the gap in this small boundary region
+            if inpainting_pipeline is not None:
+                from utils.eval_utils import batch_inpaint_junctions
+                import argparse
+
+                # Create junction info for this single gap
+                gap_center = actual_context_left + gap_size // 2
+                process_region_size = max(gap_size * 3, 16)
+                region_start = max(0, gap_center - process_region_size // 2)
+                region_end = min(boundary_length, region_start + process_region_size)
+
+                junction_info = {
+                    "junction_idx": 0,
+                    "region_start_d": region_start,
+                    "region_end_d": region_end,
+                    "junction_center_d": gap_center,
+                    "region_depth": region_end - region_start,
+                    "gap_size": gap_size,
+                }
+
+                # Convert to PyTorch tensor: (D, W, L) -> (1, 1, D, W, L)
+                boundary_pt = torch.from_numpy(boundary_volume).unsqueeze(0).unsqueeze(0).float()
+                boundary_pt = boundary_pt.to(device)
+
+                # Create dummy args for inpainting
+                dummy_args = argparse.Namespace(mask_type=mask_type)
+
+                # Inpaint this single junction
+                batch_inpaint_junctions(
+                    full_volume_pt=boundary_pt,
+                    junction_infos=[junction_info],
+                    inpainting_pipeline=inpainting_pipeline,
+                    num_inference_steps=inference_steps,
+                    device=device,
+                    args=dummy_args,
+                    seed=seed + boundary_idx * 1000,  # Different seed per boundary
+                    use_gap_filling=(mask_type == "gap_filling_compatible"),
+                    output_dir=None,
+                    inpaint_iteratively=False,
+                    inpaint_iterations=3,
+                    inpaint_region_size_ratio=0.3,
+                    axis=axis,
+                    max_batch_size=1,
+                )
+
+                # Extract the inpainted boundary volume
+                boundary_volume = boundary_pt[0, 0].cpu().numpy()
+
+                # Clean up GPU memory immediately
+                del boundary_pt
+                torch.cuda.empty_cache()
+
+                print(f"    Gap inpainted successfully")
+            else:
+                print(f"    WARNING: No inpainting pipeline, gap will remain empty")
+
+            # Extract just the gap region (the filled part)
+            inpainted_gap = boundary_volume[:, :, actual_context_left:actual_context_left + gap_size].copy()
+            inpainted_gaps.append(inpainted_gap)
+
+            del boundary_volume
+            gc.collect()
+
+        print(f"\nAll {num_boundaries} boundaries inpainted. Assembling final track...")
+
+        # Final assembly on CPU (memory efficient - concatenate with gaps)
+        # Build list of arrays to concatenate
+        arrays_to_concat = []
 
         for i, chunk_file in enumerate(chunk_files):
             chunk = np.load(chunk_file)
+            arrays_to_concat.append(chunk)
 
-            if stitched_track is None:
-                stitched_track = chunk
-                print(f"First chunk shape: {chunk.shape}")
-            else:
-                # Concatenate along axis 2 (the length/track dimension)
-                # Chunks have shape (depth, width, chunk_length)
-                stitched_track = np.concatenate([stitched_track, chunk], axis=2)
+            # Add the inpainted gap after this chunk (except for last chunk)
+            if i < len(inpainted_gaps):
+                arrays_to_concat.append(inpainted_gaps[i])
 
             del chunk
 
             if i % 5 == 0:
                 import gc
                 gc.collect()
+
+        # Concatenate all arrays along the length axis
+        stitched_track = np.concatenate(arrays_to_concat, axis=axis)
+
+        del arrays_to_concat, inpainted_gaps
+        import gc
+        gc.collect()
 
         print(f"Successfully stitched all chunks. Final shape: {stitched_track.shape}")
 
