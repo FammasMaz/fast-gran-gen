@@ -1499,7 +1499,8 @@ def _stitch_chunk_files(
 
     # Context size: how many voxels on each side of the gap to include
     # This provides context for the inpainting model
-    context_size = max(gap_size * 2, 16)  # At least 2x gap size or 16 voxels
+    # Increased from 16 to 24 to provide more grain structure context for smoother inpainting
+    context_size = max(gap_size * 3, 24)  # At least 3x gap size or 24 voxels
 
     # We stitch along axis 2 (length dimension)
     axis = 2
@@ -1535,18 +1536,25 @@ def _stitch_chunk_files(
             gc.collect()
 
             # Create small boundary volume: [end_of_i][gap][start_of_i+1]
+            # IMPORTANT: We transpose the data so the gap is along axis=0 (D dimension)
+            # This avoids problematic permutations inside batch_inpaint_junctions that
+            # can cause blocky grain artifacts due to orientation mismatch with training.
             boundary_length = actual_context_left + gap_size + actual_context_right
-            boundary_volume = np.zeros((D, W, boundary_length), dtype=np.float32)
 
-            # Place the context regions with gap in between
-            boundary_volume[:, :, :actual_context_left] = end_of_chunk_i
+            # Create boundary volume with gap along axis=0 for better inpainting:
+            # Original chunks have shape (D, W, L), we want (boundary_length, D, W)
+            # so the gap is naturally along the first axis (D for the UNet)
+            boundary_volume_transposed = np.zeros((boundary_length, D, W), dtype=np.float32)
+
+            # Transpose the context regions: (D, W, L_slice) -> (L_slice, D, W)
+            boundary_volume_transposed[:actual_context_left, :, :] = np.transpose(end_of_chunk_i, (2, 0, 1))
             # Gap is already zeros (in the middle)
-            boundary_volume[:, :, actual_context_left + gap_size:] = start_of_chunk_i_plus_1
+            boundary_volume_transposed[actual_context_left + gap_size:, :, :] = np.transpose(start_of_chunk_i_plus_1, (2, 0, 1))
 
             del end_of_chunk_i, start_of_chunk_i_plus_1
             gc.collect()
 
-            print(f"    Boundary volume shape: {boundary_volume.shape} (context={actual_context_left}+{actual_context_right}, gap={gap_size})")
+            print(f"    Boundary volume shape (transposed for inpainting): {boundary_volume_transposed.shape} (context={actual_context_left}+{actual_context_right}, gap={gap_size})")
 
             # Apply inpainting to fill the gap in this small boundary region
             if inpainting_pipeline is not None:
@@ -1554,6 +1562,7 @@ def _stitch_chunk_files(
                 import argparse
 
                 # Create junction info for this single gap
+                # Now the gap is along axis=0 (the D dimension in PyTorch convention)
                 gap_center = actual_context_left + gap_size // 2
                 process_region_size = max(gap_size * 3, 16)
                 region_start = max(0, gap_center - process_region_size // 2)
@@ -1568,14 +1577,16 @@ def _stitch_chunk_files(
                     "gap_size": gap_size,
                 }
 
-                # Convert to PyTorch tensor: (D, W, L) -> (1, 1, D, W, L)
-                boundary_pt = torch.from_numpy(boundary_volume).unsqueeze(0).unsqueeze(0).float()
+                # Convert to PyTorch tensor: (L, D, W) -> (1, 1, L, D, W)
+                # Now L is in the D position for the UNet, matching training orientation
+                boundary_pt = torch.from_numpy(boundary_volume_transposed).unsqueeze(0).unsqueeze(0).float()
                 boundary_pt = boundary_pt.to(device)
 
                 # Create dummy args for inpainting
                 dummy_args = argparse.Namespace(mask_type=mask_type)
 
-                # Inpaint this single junction
+                # Inpaint this single junction using axis=0 (no permutation needed!)
+                # This matches the training orientation where gaps are along the D axis
                 batch_inpaint_junctions(
                     full_volume_pt=boundary_pt,
                     junction_infos=[junction_info],
@@ -1589,12 +1600,12 @@ def _stitch_chunk_files(
                     inpaint_iteratively=False,
                     inpaint_iterations=3,
                     inpaint_region_size_ratio=0.3,
-                    axis=axis,
+                    axis=0,  # Use axis=0 since we pre-transposed the data
                     max_batch_size=1,
                 )
 
-                # Extract the inpainted boundary volume
-                boundary_volume = boundary_pt[0, 0].cpu().numpy()
+                # Extract the inpainted boundary volume and transpose back
+                boundary_volume_transposed = boundary_pt[0, 0].cpu().numpy()
 
                 # Clean up GPU memory immediately
                 del boundary_pt
@@ -1604,11 +1615,14 @@ def _stitch_chunk_files(
             else:
                 print(f"    WARNING: No inpainting pipeline, gap will remain empty")
 
-            # Extract just the gap region (the filled part)
-            inpainted_gap = boundary_volume[:, :, actual_context_left:actual_context_left + gap_size].copy()
+            # Extract just the gap region (the filled part) and transpose back to (D, W, gap_size)
+            # From transposed: (boundary_length, D, W) -> extract gap -> (gap_size, D, W)
+            # Then transpose to (D, W, gap_size) for concatenation along axis=2
+            inpainted_gap_transposed = boundary_volume_transposed[actual_context_left:actual_context_left + gap_size, :, :]
+            inpainted_gap = np.transpose(inpainted_gap_transposed, (1, 2, 0)).copy()
             inpainted_gaps.append(inpainted_gap)
 
-            del boundary_volume
+            del boundary_volume_transposed, inpainted_gap_transposed
             gc.collect()
 
         print(f"\nAll {num_boundaries} boundaries inpainted. Assembling final track...")
