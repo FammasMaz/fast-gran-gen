@@ -2,6 +2,7 @@ import json
 import numpy as np
 import pyvista as pv
 from scipy import ndimage
+from scipy.spatial import ConvexHull
 from scipy.spatial.distance import cdist
 from sklearn.cluster import DBSCAN
 from skimage import measure, morphology, filters
@@ -2266,6 +2267,12 @@ class PolyhedronSegmentation:
             if actual_smoothing > 0:
                 mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
 
+            # Compute convex hull BEFORE decimation so that LMGC90 receives
+            # a shape that is already convex.  This prevents the variable
+            # distortion caused by LMGC90's implicit convex-hull computation
+            # on non-convex marching-cubes meshes.
+            mesh = self._to_convex_hull(mesh, label_id)
+
             # Decimation
             mesh = self._apply_aggressive_decimation(
                 mesh, decimation_ratio, target_vertices=target_vertices, target_faces=40
@@ -2300,6 +2307,61 @@ class PolyhedronSegmentation:
         except Exception as e:
             print(f"Error extracting polyhedron {label_id}: {e}")
             return {"vertices": [], "faces": [], "volume": 0, "n_vertices": 0, "n_faces": 0, "label_id": label_id}
+
+    def _to_convex_hull(self, mesh: "pv.PolyData", label_id: int = None) -> "pv.PolyData":
+        """
+        Convert a mesh to its convex hull.
+
+        LMGC90's POLYR contactor requires convex polyhedra. The marching-cubes
+        + decimation pipeline can produce non-convex shapes whose convex hull
+        (computed implicitly by LMGC90) differs unpredictably from the original
+        mesh.  By computing the convex hull here we guarantee that:
+          1. The grain shape stored in the JSON is already convex.
+          2. Subsequent decimation preserves convexity.
+          3. Volume/shape metrics match what LMGC90 will actually use.
+
+        Args:
+            mesh: PyVista surface mesh to convexify.
+            label_id: Optional grain label for logging.
+
+        Returns:
+            A new PyVista PolyData representing the convex hull.
+        """
+        if mesh.n_points < 4:
+            return mesh
+
+        try:
+            hull = ConvexHull(mesh.points)
+            hull_point_indices = hull.vertices
+            hull_points = mesh.points[hull_point_indices].copy()
+
+            # Remap face indices from the original point array to the
+            # compact hull-vertex array.
+            old_to_new = np.full(mesh.n_points, -1, dtype=np.intp)
+            old_to_new[hull_point_indices] = np.arange(len(hull_point_indices))
+            hull_faces = old_to_new[hull.simplices]
+
+            # Build PyVista faces array: [3, v0, v1, v2, 3, v0, v1, v2, ...]
+            n_tri = len(hull_faces)
+            pv_faces = np.empty((n_tri, 4), dtype=np.intp)
+            pv_faces[:, 0] = 3
+            pv_faces[:, 1:] = hull_faces
+            hull_mesh = pv.PolyData(hull_points, pv_faces.ravel())
+            hull_mesh = hull_mesh.clean()
+
+            # Orient normals outward for correct volume computation
+            hull_mesh = hull_mesh.compute_normals(
+                auto_orient_normals=True, flip_normals=False, inplace=False
+            )
+
+            if hull_mesh.n_points >= 4 and hull_mesh.n_cells >= 4:
+                return hull_mesh
+        except Exception as e:
+            if label_id is not None:
+                print(f"    WARNING: Convex hull failed for polyhedron {label_id}: {e}")
+
+        # Fall back to the original mesh when the hull computation fails.
+        return mesh
 
     def _apply_aggressive_decimation(
         self, mesh, decimation_ratio: float, target_vertices: int = 30, target_faces: int = 40, label_id: int = None
@@ -2461,6 +2523,10 @@ class PolyhedronSegmentation:
             if actual_smoothing > 0:
                 mesh = mesh.smooth(n_iter=actual_smoothing, relaxation_factor=0.1)
 
+            # Compute convex hull BEFORE decimation so that LMGC90 receives
+            # a shape that is already convex.
+            mesh = self._to_convex_hull(mesh, label_id)
+
             # Decimation
             mesh = self._apply_aggressive_decimation(
                 mesh, decimation_ratio, target_vertices=target_vertices, target_faces=40, label_id=label_id
@@ -2583,6 +2649,12 @@ class PolyhedronSegmentation:
                         "n_faces": 0,
                         "skipped_reason": "failed_post_smoothing_validation",
                     }
+
+        # Compute convex hull BEFORE decimation so that LMGC90 receives
+        # a shape that is already convex.  This prevents the variable
+        # distortion caused by LMGC90's implicit convex-hull computation
+        # on non-convex marching-cubes meshes.
+        mesh = self._to_convex_hull(mesh, label_id)
 
         # Apply AGGRESSIVE decimation to reduce polygon count (targeting ~30 vertices, ~40 faces)
         if 0 < decimation_ratio < 1:
