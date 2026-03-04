@@ -1636,13 +1636,14 @@ class PolyhedronSegmentation:
         This is used by the chunked processing to avoid duplicating the post-segmentation logic.
         """
         # Extract parameters (same as in process_voxel_grid)
-        min_polyhedron_size = kwargs.get("min_polyhedron_size", 100)
+        min_polyhedron_size = kwargs.get("min_polyhedron_size", 120)
         smoothing_iterations = kwargs.get("smoothing_iterations", 10)
         decimation_ratio = kwargs.get("decimation_ratio", 0.8)
         num_workers = kwargs.get("num_workers", 1)
         use_sdf = kwargs.get("use_sdf", True)
         remove_boundary_polyhedrons = kwargs.get("remove_boundary_polyhedrons", True)
         max_voxel_aspect_ratio = kwargs.get("max_voxel_aspect_ratio", 20.0)
+        max_polyhedron_size = kwargs.get("max_polyhedron_size", 0)
         coordinate_validation_threshold = kwargs.get("coordinate_validation_threshold", 1e4)
         enable_mesh_range_outlier_filter = kwargs.get("enable_mesh_range_outlier_filter", True)
         mesh_range_outlier_iqr_factor = kwargs.get("mesh_range_outlier_iqr_factor", 1.5)
@@ -1665,7 +1666,8 @@ class PolyhedronSegmentation:
         if use_early_filtering:
             print("Using optimized early filtering...")
             label_ids_to_process, filter_stats = self._early_filter_labels_in_chunks(
-                labeled_grid, num_labels, min_polyhedron_size, remove_boundary_polyhedrons, max_voxel_aspect_ratio
+                labeled_grid, num_labels, min_polyhedron_size, remove_boundary_polyhedrons, max_voxel_aspect_ratio,
+                max_polyhedron_size=max_polyhedron_size,
             )
             boundary_removed_count = filter_stats["boundary_removed_count"]
             aspect_ratio_removed_count = filter_stats["aspect_ratio_removed_count"]
@@ -1684,6 +1686,18 @@ class PolyhedronSegmentation:
             print(
                 f"Labels remaining after min_polyhedron_size ({min_polyhedron_size} voxels) filter: {len(candidate_label_ids)}"
             )
+
+            # Filter by maximum size in chunked path
+            if max_polyhedron_size > 0 and len(candidate_label_ids) > 0:
+                before_max = len(candidate_label_ids)
+                candidate_label_ids = [
+                    label_id for label_id in candidate_label_ids
+                    if np.sum(labeled_grid == label_id) <= max_polyhedron_size
+                ]
+                print(
+                    f"Labels remaining after max_polyhedron_size ({max_polyhedron_size} voxels) filter: "
+                    f"{len(candidate_label_ids)} (removed {before_max - len(candidate_label_ids)})"
+                )
 
             min_size_filtered_count = len(candidate_label_ids)  # Store for metadata
             label_ids_to_process = candidate_label_ids
@@ -1983,6 +1997,7 @@ class PolyhedronSegmentation:
                 "use_sdf_mesh_extraction": use_sdf,
                 "remove_boundary_polyhedrons": remove_boundary_polyhedrons,
                 "max_voxel_aspect_ratio": max_voxel_aspect_ratio,
+                "max_polyhedron_size": max_polyhedron_size,
                 "coordinate_validation_threshold": coordinate_validation_threshold,
                 "enable_mesh_range_outlier_filter": enable_mesh_range_outlier_filter,
                 "mesh_range_outlier_iqr_factor": mesh_range_outlier_iqr_factor,
@@ -2756,7 +2771,7 @@ class PolyhedronSegmentation:
         self,
         voxel_grid: np.ndarray,
         segmentation_method: str = "watershed",  # Default changed to "watershed"
-        min_polyhedron_size: int = 100,
+        min_polyhedron_size: int = 120,
         smoothing_iterations: int = 10,
         decimation_ratio: float = 0.8,
         num_workers: int = 1,
@@ -2775,6 +2790,7 @@ class PolyhedronSegmentation:
         use_sdf: bool = True,
         remove_boundary_polyhedrons: bool = True,
         max_voxel_aspect_ratio: Optional[float] = 20.0,
+        max_polyhedron_size: int = 0,  # 0 to disable
         coordinate_validation_threshold: float = 1e4,  # New parameter
         # New parameters for mesh range outlier filter
         enable_mesh_range_outlier_filter: bool = True,
@@ -2885,6 +2901,20 @@ class PolyhedronSegmentation:
         print(
             f"Labels remaining after min_polyhedron_size ({min_polyhedron_size} voxels) filter: {len(candidate_label_ids)}"
         )
+
+        # Filter by maximum size (remove oversized merged grains)
+        max_size_removed_count = 0
+        if max_polyhedron_size > 0 and len(candidate_label_ids) > 0:
+            before_max = len(candidate_label_ids)
+            candidate_label_ids = [
+                label_id for label_id in candidate_label_ids
+                if label_to_count[label_id] <= max_polyhedron_size
+            ]
+            max_size_removed_count = before_max - len(candidate_label_ids)
+            print(
+                f"Labels remaining after max_polyhedron_size ({max_polyhedron_size} voxels) filter: "
+                f"{len(candidate_label_ids)} (removed {max_size_removed_count})"
+            )
 
         label_ids_to_process = candidate_label_ids
         boundary_removed_count = 0
@@ -3199,6 +3229,7 @@ class PolyhedronSegmentation:
                 "use_sdf_mesh_extraction": use_sdf,
                 "remove_boundary_polyhedrons": remove_boundary_polyhedrons,
                 "max_voxel_aspect_ratio": max_voxel_aspect_ratio,
+                "max_polyhedron_size": max_polyhedron_size,
                 "coordinate_validation_threshold": coordinate_validation_threshold,
                 "enable_mesh_range_outlier_filter": enable_mesh_range_outlier_filter,
                 "mesh_range_outlier_iqr_factor": mesh_range_outlier_iqr_factor,
@@ -3967,6 +3998,7 @@ class PolyhedronSegmentation:
         min_polyhedron_size: int,
         remove_boundary_polyhedrons: bool,
         max_voxel_aspect_ratio: Optional[float] = None,
+        max_polyhedron_size: int = 0,
     ) -> Tuple[List[int], Dict]:
         """
         Perform early filtering to reduce the number of labels before expensive mesh extraction.
@@ -3982,6 +4014,17 @@ class PolyhedronSegmentation:
         size_filtered_labels = size_filtered_labels[size_filtered_labels > 0]  # Remove background
 
         print(f"Size filter: {len(size_filtered_labels)} labels remain after min size {min_polyhedron_size}")
+
+        # Filter by maximum size (remove oversized merged grains)
+        max_size_removed_count = 0
+        if max_polyhedron_size > 0 and len(size_filtered_labels) > 0:
+            before_max = len(size_filtered_labels)
+            size_filtered_labels = np.array([
+                label for label in size_filtered_labels
+                if label_sizes[label] <= max_polyhedron_size
+            ])
+            max_size_removed_count = before_max - len(size_filtered_labels)
+            print(f"Max size filter: {len(size_filtered_labels)} labels remain after max size {max_polyhedron_size} (removed {max_size_removed_count})")
 
         # Filter boundary labels if requested
         boundary_removed_count = 0
@@ -4174,7 +4217,7 @@ def main():
     )
     # Parameters for all watershed types / general segmentation
     parser.add_argument(
-        "--min-distance", type=int, default=7, help="Minimum distance between watershed markers (peak_local_max)"
+        "--min-distance", type=int, default=5, help="Minimum distance between watershed markers (peak_local_max)"
     )  # Default changed slightly
     parser.add_argument(
         "--erosion-iterations", type=int, default=1, help="Erosion iterations before watershed/marker finding"
@@ -4211,8 +4254,12 @@ def main():
         "--decimation-ratio", type=float, default=0.8, help="Mesh decimation ratio (0-1, e.g., 0.8 for 80%% reduction)"
     )
     parser.add_argument(
-        "--min-polyhedron-size", type=int, default=100, help="Minimum polyhedron size in voxels to keep"
+        "--min-polyhedron-size", type=int, default=120, help="Minimum polyhedron size in voxels to keep"
     )  # Default changed
+    parser.add_argument(
+        "--max-polyhedron-size", type=int, default=0,
+        help="Maximum polyhedron size in voxels to keep (0 to disable). Removes oversized merged grains."
+    )
     parser.add_argument(
         "--use-sdf-mesh",  # Renamed for clarity
         action=argparse.BooleanOptionalAction,  # Allows --use-sdf-mesh / --no-use-sdf-mesh
@@ -4502,6 +4549,7 @@ def main():
             use_sdf=args.use_sdf_mesh,
             remove_boundary_polyhedrons=args.remove_boundary_polyhedrons,
             max_voxel_aspect_ratio=args.max_voxel_aspect_ratio,
+            max_polyhedron_size=args.max_polyhedron_size,
             coordinate_validation_threshold=args.coordinate_validation_threshold,
             # Mesh range outlier filter parameters
             enable_mesh_range_outlier_filter=args.enable_mesh_range_outlier_filter,
@@ -4539,6 +4587,7 @@ def main():
             use_sdf=args.use_sdf_mesh,  # Passed to process_voxel_grid
             remove_boundary_polyhedrons=args.remove_boundary_polyhedrons,
             max_voxel_aspect_ratio=args.max_voxel_aspect_ratio,
+            max_polyhedron_size=args.max_polyhedron_size,
             coordinate_validation_threshold=args.coordinate_validation_threshold,
             # Pass new mesh range outlier filter parameters
             enable_mesh_range_outlier_filter=args.enable_mesh_range_outlier_filter,
