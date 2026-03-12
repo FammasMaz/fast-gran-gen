@@ -90,6 +90,12 @@ def get_args():
     parser.add_argument(
         "--use_2d_unet", action="store_true", help="Use a 2D UNet treating depth as channels instead of a 3D UNet."
     )  # not recommended. 2D UNet is not as good as 3D UNet.
+    parser.add_argument(
+        "--quantize",
+        type=str2bool,
+        default=False,
+        help="Enable ternary (1.58-bit) quantization-aware training. Only supported with 3D UNet.",
+    )
 
     ##### EMA (Exponential Moving Average) Configuration #####
     parser.add_argument(

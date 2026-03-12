@@ -306,6 +306,35 @@ class Trainer:
                     except Exception as e:
                         print(f"TensorBoard scalar logging failed: {e}")
 
+                # Log quantization statistics if quantization is enabled
+                if getattr(self.args, "quantize", False):
+                    try:
+                        from modules.quantization import log_quantization_stats
+
+                        q_stats = log_quantization_stats(self.accelerator.unwrap_model(self.model))
+                        q_log = {
+                            "quant/avg_sparsity": q_stats["avg_sparsity"],
+                            "quant/avg_alpha": q_stats["avg_alpha"],
+                            "quant/num_quantized_layers": q_stats["num_quantized_layers"],
+                        }
+                        if self.args.logger == "wandb":
+                            try:
+                                wandb.log({**q_log, "epoch": epoch})
+                            except Exception as e:
+                                print(f"WandB quantization logging failed: {e}")
+                        elif self.args.logger == "tensorboard" and self.summary_writer:
+                            for k, v in q_log.items():
+                                self.summary_writer.add_scalar(k, v, epoch)
+                        if epoch == 0 or (epoch + 1) % 10 == 0:
+                            self.accelerator.print(
+                                f"[Quantization] Epoch {epoch + 1}: "
+                                f"avg_sparsity={q_stats['avg_sparsity']:.3f}, "
+                                f"avg_alpha={q_stats['avg_alpha']:.4f}, "
+                                f"layers={q_stats['num_quantized_layers']}"
+                            )
+                    except Exception as e:
+                        self.accelerator.print(f"Quantization stats logging failed: {e}")
+
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     self.log_reconstructions(epoch)
                     inpainted_vti, original_vti, masked_vti = self.generate_sample_images(epoch)
@@ -759,6 +788,12 @@ class Trainer:
 
             with open(os.path.join(str(self.args.output_dir), "training_args.json"), "w") as f:
                 json.dump(args_dict, f, indent=4)
+
+            # Also write training_args.json into EMA artifact directory for auto-detection
+            if self.use_ema and self.ema is not None:
+                ema_args_path = os.path.join(self.args.output_dir, "ema_model", "training_args.json")
+                with open(ema_args_path, "w") as f:
+                    json.dump(args_dict, f, indent=4)
 
     def send_telegram_loss_update(self, epoch, train_loss, val_loss, best=False):
         if not self.accelerator.is_main_process or self.disable_telegram:

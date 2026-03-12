@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import argparse
 import os
+import json
 from diffusers import DDPMPipeline, DDIMScheduler, DiffusionPipeline
 from pathlib import Path
 import time
@@ -147,6 +148,11 @@ def main():
         default=None,
         help="Value to threshold the final volume at (None = no thresholding) (used with 'separate_inpainting' mode)",
     )
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Apply ternary (1.58-bit) quantization to the model. Auto-detected from training_args.json if present.",
+    )
 
     args = parser.parse_args()
 
@@ -194,6 +200,24 @@ def main():
     except Exception as e:
         print(f"Error loading BASE pipeline or applying workaround: {e}")
         exit()
+
+    # Auto-detect and apply quantization for base model
+    from modules.quantization import detect_quantization_from_metadata, quantize_model
+
+    base_was_quantized = detect_quantization_from_metadata(model_path)
+    if base_was_quantized and not args.quantize:
+        print(
+            "WARNING: Base model was trained with --quantize but is being loaded without it. "
+            "Inference behavior will differ from training. Add --quantize to match training."
+        )
+    if args.quantize and not base_was_quantized:
+        print(
+            "WARNING: --quantize is set but the base model was not trained with quantization. "
+            "Results may be poor."
+        )
+    if args.quantize:
+        quantize_model(pipeline.unet)
+        print("Applied ternary quantization to base pipeline UNet.")
 
     inpainting_pipeline = None
     inpainting_unet = None
@@ -246,6 +270,18 @@ def main():
                     )
 
             print("Inpainting pipeline loaded successfully.")
+
+            # Auto-detect and apply quantization for inpainting model
+            inpainting_was_quantized = detect_quantization_from_metadata(inpainting_model_path)
+            if inpainting_was_quantized and not args.quantize:
+                print(
+                    "WARNING: Inpainting model was trained with --quantize but loaded without it. "
+                    "Add --quantize to match training."
+                )
+            if args.quantize:
+                quantize_model(inpainting_pipeline.unet)
+                print("Applied ternary quantization to inpainting pipeline UNet.")
+
         except Exception as e:
             print(f"Error loading INPAINTING pipeline: {e}")
             exit()

@@ -93,6 +93,9 @@ def main():
         f"Sample size (D, H, W): {sample_size_3d}\n"
     )
 
+    if args.quantize and args.use_2d_unet:
+        raise ValueError("--quantize is only supported with the 3D UNet. Remove --use_2d_unet or --quantize.")
+
     if args.use_2d_unet:
         print("Using 2D UNet (Depth as Channels)")
         model = UNet2DModel(
@@ -147,6 +150,13 @@ def main():
         model_type_str = "UNet3DModel (Inpainting)"
         inpainting_channels = C_in * 2 + 1
         model_input_shape_str = f"({inpainting_channels}, {D}, {H}, {W})"
+
+    if args.quantize:
+        from modules.quantization import quantize_model, BitConv3d, BitLinear
+
+        quantize_model(model)
+        quantized_count = sum(1 for m in model.modules() if isinstance(m, (BitConv3d, BitLinear)))
+        print(f"Quantized {quantized_count} layers to ternary (1.58-bit)")
 
     model_params = sum(p.numel() for p in model.parameters())
     print(f"Model Architecture: {model_type_str}")
