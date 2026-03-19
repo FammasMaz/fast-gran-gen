@@ -12,6 +12,7 @@ from utils.eval_utils import (
     numpy_to_pt,
     pt_to_numpy,
 )
+from utils.device_utils import get_device, empty_cache, get_device_count, is_cuda, get_torch_dtype, apply_low_memory_defaults
 from modules.trainer import MaskGenerator3D
 
 # Try to import pyvista with xvfb for headless rendering
@@ -341,18 +342,27 @@ def save_3d_volume_render(volume, output_path, title=""):
         return False
 
 
-def load_models(model_path, inpainting_model_path, scheduler_type="ddim"):
+def load_models(model_path, inpainting_model_path, scheduler_type="ddim", torch_dtype=None, low_memory=False, device_preference="auto"):
     """
     Load models once and return them. This avoids repeated loading.
+
+    Args:
+        torch_dtype: Optional torch.dtype (e.g. torch.float16) for half-precision inference.
+        low_memory: If True, enable attention slicing to reduce memory usage.
+        device_preference: Device preference string ('auto', 'cuda', 'mps', 'cpu').
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = str(get_device(device_preference))
     print(f"Using device: {device}")
 
     model_path = Path(model_path)
     print(f"Loading BASE diffusion pipeline from: {model_path}")
 
+    dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
+
     try:
-        pipeline = DDPMPipeline.from_pretrained(model_path).to(device)
+        pipeline = DDPMPipeline.from_pretrained(model_path, **dtype_kwargs).to(device)
+        if low_memory:
+            apply_low_memory_defaults(pipeline, device)
         if scheduler_type == "ddim":
             pipeline.scheduler = DDIMScheduler.from_pretrained(model_path / "scheduler")
         unet = pipeline.unet
@@ -385,8 +395,10 @@ def load_models(model_path, inpainting_model_path, scheduler_type="ddim"):
         print(f"Loading INPAINTING diffusion pipeline from: {inpainting_model_path}")
         try:
             inpainting_pipeline = DiffusionPipeline.from_pretrained(
-                inpainting_model_path
+                inpainting_model_path, **dtype_kwargs
             ).to(device)
+            if low_memory:
+                apply_low_memory_defaults(inpainting_pipeline, device)
             print("Inpainting pipeline loaded successfully.")
         except Exception as e:
             print(f"Error loading INPAINTING pipeline: {e}")
@@ -873,7 +885,7 @@ def stitch_multiple_layers_with_cross_layer_batching(
 
                 # Move back to CPU immediately after processing to free GPU memory
                 layer_data[layer_id]["volume"] = layer_data[layer_id]["volume"].cpu()
-                torch.cuda.empty_cache()
+                empty_cache(device)
 
                 processed_layers += 1
 
@@ -942,16 +954,13 @@ def create_strips_in_batches(
 
     print(f"Creating {total_strips} strips in batches of {strip_batch_size}")
 
+    num_batches = (total_strips + strip_batch_size - 1) // strip_batch_size
+
     # Process strips in batches
-    for batch_start in range(0, total_strips, strip_batch_size):
+    for batch_start in tqdm(range(0, total_strips, strip_batch_size), total=num_batches, desc="Strip batches"):
         batch_end = min(batch_start + strip_batch_size, total_strips)
         batch_positions = strip_positions[batch_start:batch_end]
         current_batch_size = len(batch_positions)
-
-        print(
-            f"  Processing strip batch {batch_start // strip_batch_size + 1}/{(total_strips + strip_batch_size - 1) // strip_batch_size} "
-            f"({current_batch_size} strips)"
-        )
 
         # Generate all blocks for this batch of strips simultaneously
         batch_strips = []
@@ -1017,7 +1026,7 @@ def create_strips_in_batches(
                 all_blocks.extend(blocks_batch)
 
             # Clear GPU cache after each block batch to prevent accumulation
-            torch.cuda.empty_cache()
+            empty_cache(device)
 
         print(f"    Generated {len(all_blocks)} blocks total")
 
@@ -1104,7 +1113,7 @@ def create_strips_in_batches(
         # Clear memory after each strip batch to prevent accumulation
         del all_blocks
         del batch_strips
-        torch.cuda.empty_cache()
+        empty_cache(device)
         import gc
         gc.collect()
 
@@ -1161,7 +1170,7 @@ def create_railway_track_3d_chunked(
     print(f"Will process {num_chunks} chunks")
 
     # Detect available GPUs
-    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    available_gpus = get_device_count(device) if is_cuda(device) else 0
     effective_num_gpus = min(num_gpus, available_gpus, num_chunks)
 
     if effective_num_gpus > 1:
@@ -1250,7 +1259,7 @@ def create_railway_track_3d_chunked(
 
         # Free memory
         del chunk_track
-        torch.cuda.empty_cache()
+        empty_cache(device)
         import gc
         gc.collect()
 
@@ -1284,7 +1293,8 @@ def _process_chunk_on_gpu(args):
 
     # Set this process to use the specified GPU
     device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    if is_cuda(device):
+        torch.cuda.set_device(gpu_id)
 
     print(f"[GPU {gpu_id}] Processing chunk {chunk_idx}")
 
@@ -1350,7 +1360,7 @@ def _process_chunk_on_gpu(args):
     finally:
         # Clean up
         del unet, scheduler, inpainting_pipeline
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
 
 def _create_chunks_multi_gpu(
@@ -1419,7 +1429,7 @@ def _create_chunks_multi_gpu(
 
     # For multi-GPU mode, we need to determine which device to use for stitching inpainting
     # Use the first available GPU (cuda:0) for the final stitching step
-    stitch_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    stitch_device = str(get_device("auto"))  # Use first available accelerator
 
     # Reload inpainting pipeline on the stitching device if needed
     if inpainting_pipeline is not None:
@@ -1609,7 +1619,7 @@ def _stitch_chunk_files(
 
                 # Clean up GPU memory immediately
                 del boundary_pt
-                torch.cuda.empty_cache()
+                empty_cache(device)
 
                 print(f"    Gap inpainted successfully")
             else:
@@ -1923,6 +1933,9 @@ def create_railway_track(
     chunk_length=None,  # Number of length blocks per chunk (None = auto, 0 = disabled)
     chunk_threshold=50,  # Auto-enable chunking when grids_depth exceeds this
     num_gpus=1,  # Number of GPUs for parallel chunk processing
+    torch_dtype=None,  # Optional torch.dtype for half-precision inference
+    low_memory=False,  # Enable attention slicing for low-memory devices
+    device_preference="auto",  # Device preference ('auto', 'cuda', 'mps', 'cpu')
     **kwargs,
 ):
     """
@@ -1949,7 +1962,9 @@ def create_railway_track(
     # Load models once
     print("Loading models...")
     unet, scheduler, inpainting_pipeline, device = load_models(
-        model_path, inpainting_model_path, scheduler_type
+        model_path, inpainting_model_path, scheduler_type,
+        torch_dtype=torch_dtype, low_memory=low_memory,
+        device_preference=device_preference,
     )
 
     if unet is None:
@@ -2024,7 +2039,7 @@ def create_railway_track(
             # Auto-detect GPUs if num_gpus is 0
             effective_num_gpus = num_gpus
             if num_gpus == 0:
-                effective_num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                effective_num_gpus = get_device_count(device) if is_cuda(device) else 1
                 print(f"Auto-detected {effective_num_gpus} GPU(s)")
 
             return create_railway_track_3d_chunked(
@@ -2295,6 +2310,26 @@ def main():
         dest="save_intermediates",
         help="Save intermediate pipeline stages (blocks, stitched volume) and visualizations for paper figures",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float32", "float16"],
+        help="Model precision. 'float16' halves memory usage. 'auto' keeps the model's saved precision.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Device to use for computation. 'auto' selects the best available backend (CUDA > MPS > CPU).",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        default=False,
+        help="Enable low-memory optimisations (attention slicing). Recommended for Apple Silicon with limited RAM.",
+    )
 
     args = parser.parse_args()
 
@@ -2346,6 +2381,9 @@ def main():
         chunk_length=0 if args.no_chunking else args.chunk_length,
         chunk_threshold=args.chunk_threshold,
         num_gpus=args.num_gpus,
+        torch_dtype=get_torch_dtype(args.dtype, args.device),
+        low_memory=args.low_memory,
+        device_preference=args.device,
     )
 
     end_time = time.time()

@@ -5,6 +5,7 @@ from dataloader import get_voxel_dataloaders
 from modules.unet import UNet3DModel
 from diffusers import UNet2DModel
 from utils.telegram_notifier import notifier
+from utils.device_utils import get_system_info, get_device_count
 import platform
 import torch
 import datetime
@@ -19,16 +20,7 @@ def main():
     args = get_args()
 
     # some system debug info
-    system_info = {
-        "system": platform.system(),
-        "release": platform.release(),
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "cuda_available": torch.cuda.is_available(),
-        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "current_device": torch.cuda.current_device() if torch.cuda.is_available() else None,
-        "device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-    }
+    system_info = get_system_info(args.device)
 
     # send initial notification with system info via TG
     notifier.send_message(
@@ -39,10 +31,11 @@ def main():
         f"Device: {system_info['device_name']}"
     )
 
-    # ensure batch size is reasonable for the number of GPUs
-    if args.batch_size < torch.cuda.device_count() * 2 and torch.cuda.device_count() > 1:
-        print(f"Warning: Batch size {args.batch_size} may be too small for {torch.cuda.device_count()} GPUs")
-        print(f"Consider increasing batch size to at least {torch.cuda.device_count() * 2}")
+    # ensure batch size is reasonable for the number of accelerators
+    n_devices = get_device_count(args.device)
+    if n_devices > 1 and args.batch_size < n_devices * 2:
+        print(f"Warning: Batch size {args.batch_size} may be too small for {n_devices} GPUs")
+        print(f"Consider increasing batch size to at least {n_devices * 2}")
 
     train_loader, val_loader = get_voxel_dataloaders(
         h5_file_path=args.root_dir,  # path to the h5 file
@@ -207,8 +200,10 @@ def main():
 if __name__ == "__main__":
     import multiprocessing
 
+    # macOS (Apple Silicon / MPS) requires "spawn"; Linux can use "fork"
+    start_method = "spawn" if platform.system() == "Darwin" else "fork"
     try:
-        multiprocessing.set_start_method("fork")
+        multiprocessing.set_start_method(start_method)
     except RuntimeError:
         pass
     main()

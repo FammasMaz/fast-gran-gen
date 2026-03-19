@@ -48,6 +48,49 @@ CACHE_DIR="/path/to/cache/"
 NUM_GPU=2  # Number of GPUs to use
 ```
 
+## Apple Silicon / MPS Support
+
+This project fully supports **Apple Silicon Macs** (M1/M2/M3/M4) via PyTorch's Metal Performance Shaders (MPS) backend.
+
+### Device Selection
+
+All scripts accept a `--device` flag:
+
+| Value | Behaviour |
+|-------|----------|
+| `auto` | **(default)** CUDA → MPS → CPU, picks best available |
+| `cuda` | Force CUDA (falls back to CPU if unavailable) |
+| `mps` | Force MPS (falls back to CPU if unavailable) |
+| `cpu` | Force CPU |
+
+### Low-Memory Inference
+
+On Macs with limited unified memory (8–16 GB), combine these options to reduce peak memory:
+
+```bash
+# 1. Limit how much RAM PyTorch's MPS allocator can use (e.g. 50%)
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.5
+export PYTORCH_MPS_LOW_WATERMARK_RATIO=0.0
+
+# 2. Use half precision + attention slicing
+python eval.py --model_path "$BASE" \
+  --device mps --dtype float16 --low-memory \
+  ... # other args
+```
+
+| Flag | Effect |
+|------|--------|
+| `--dtype float16` | Loads model weights in half precision (halves memory) |
+| `--low-memory` | Enables attention slicing (computes attention in chunks) |
+
+> **Note:** MPS does not support `fp16` *training*. The `--dtype float16` flag is for **inference only**. During training, the code automatically disables mixed precision on MPS.
+
+### Known MPS Limitations
+
+- **Multi-GPU** is not applicable (Apple Silicon has a single unified GPU)
+- **`fp16` mixed-precision training** is not supported; full precision is used automatically
+- **`torch.Generator(device="mps")`** is not supported; the code transparently uses CPU generators
+
 ## Training
 
 ### Training the Base Unconditional Model
@@ -125,7 +168,18 @@ python eval.py --model_path "$BASE" \
 --scheduler_type "ddim" \
 --n_blocks 100 \
 --inpaint_region_size_ratio 0.3 \
---inference_steps 25
+--inference_steps 25 \
+--device auto           # auto / cuda / mps / cpu
+```
+
+For **low-memory** setups (e.g. Apple Silicon with 8 GB RAM):
+
+```bash
+python eval.py --model_path "$BASE" \
+--inpainting_model_path "$INPAINTING" \
+--output_dir "out/eval/" \
+--device mps --dtype float16 --low-memory \
+--n_blocks 10 --batch_size 1 --inference_steps 25
 ```
 
 ### Enhanced Evaluation Pipeline
@@ -197,7 +251,19 @@ python railway_track.py --model_path "/path/to/base/model" \
 --batch_size 16 \
 --seed 484 \
 --strip_batch_size 32 \
---inpaint_batch_size 5
+--inpaint_batch_size 5 \
+--device auto           # auto / cuda / mps / cpu
+```
+
+For **low-memory** setups:
+
+```bash
+python railway_track.py --model_path "/path/to/base/model" \
+--inpainting_model_path "/path/to/inpainting/model" \
+--output_dir "/path/to/output/" \
+--target_length 4.0 --target_depth 0.3 --target_width 0.6 \
+--device mps --dtype float16 --low-memory \
+--batch_size 1 --strip_batch_size 4 --inpaint_batch_size 2
 ```
 
 Best Segmentation Results were achieved with these parameters:

@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from utils.device_utils import get_device
 
 
 # convert string to boolean for easier debugging
@@ -42,8 +43,10 @@ def get_args():
         "--accelerator", type=str2bool, default=True
     )  # prepares the code for distributed/mixed precision training
     parser.add_argument(
-        "--device", type=str, default="cuda"
-    )  # default device to use where accelerator is not available
+        "--device", type=str, default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Device to use for computation. 'auto' selects the best available backend (CUDA > MPS > CPU)."
+    )
     parser.add_argument(
         "--transforms", type=str2bool, default=False
     )  # TODO:currently not used, but can be used to apply random transformations
@@ -225,6 +228,10 @@ def get_args():
     )  # a boolean flag to disable all Telegram notifications and image sending. easier to debug on the go.
 
     args = parser.parse_args()
+
+    # Resolve the device preference to a concrete torch.device string
+    resolved_device = get_device(args.device)
+    args.device = str(resolved_device)  # e.g. "cuda", "mps", "cpu"
 
     args.output_dir = Path(args.output_dir)
     args.model_dir = args.output_dir / "diffusion_model"  # directory to save the model checkpoints and logs by default

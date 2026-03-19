@@ -8,6 +8,7 @@ import time
 from diffusers import DiffusionPipeline, DDPMPipeline, DDIMScheduler
 from diffusers.utils import logging
 import argparse
+from utils.device_utils import empty_cache, get_generator, randn_compatible
 
 logger = logging.get_logger(__name__)
 
@@ -75,7 +76,7 @@ def generate_overlapping_volume(
 
     if seed is None:
         seed = int(time.time())
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = get_generator(device, seed)
 
     sample_size = unet.config.sample_size
 
@@ -98,7 +99,7 @@ def generate_overlapping_volume(
 
     for i in tqdm(range(n_blocks), desc="Generating Inpainting Blocks"):
         # init latents for the entire block on GPU
-        latents = torch.randn((1, C, D, H, W), generator=generator, device=device)
+        latents = randn_compatible((1, C, D, H, W), device, generator=generator)
 
         # get the known latent context
         known_latent_part = context_latent
@@ -168,7 +169,7 @@ def generate_overlapping_volume(
         del block, unet_input, noise_pred, prev_sample
         if "masked_known_latent" in locals():
             del masked_known_latent
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
     return cpu_parts, None
 
@@ -251,9 +252,9 @@ def generate_single_volume(
 
     # process the batch, applying retry logic per volume
     volumes_np_0_1 = []
-    base_generator = torch.Generator(device=device).manual_seed(seed)
+    base_generator = get_generator(device, seed)
 
-    latents = torch.randn(image_shape, generator=base_generator, device=device)
+    latents = randn_compatible(image_shape, device, generator=base_generator)
     scheduler.set_timesteps(num_steps)
     unet.eval()
     with torch.no_grad():
@@ -279,8 +280,8 @@ def generate_single_volume(
                 print(f"  Retrying volume {i + 1}/{batch_size} (attempt {retries}/{max_retries})...")
                 volume_seed = int.from_bytes(os.urandom(8), "big")
 
-                volume_generator = torch.Generator(device=device).manual_seed(volume_seed)
-                single_latent = torch.randn((1, C, D, H, W), generator=volume_generator, device=device)
+                volume_generator = get_generator(device, volume_seed)
+                single_latent = randn_compatible((1, C, D, H, W), device, generator=volume_generator)
 
                 scheduler.set_timesteps(num_steps)
                 with torch.no_grad():
@@ -309,7 +310,7 @@ def generate_single_volume(
             else:
                 retries += 1
                 del vol_np, scaled_vol, clipped_vol, block_cpu
-                torch.cuda.empty_cache()
+                empty_cache(device)
 
         if not volume_meets_criteria:
             print(
@@ -324,7 +325,7 @@ def generate_single_volume(
             progress_callback()
 
     del latents
-    torch.cuda.empty_cache()
+    empty_cache(device)
     return volumes_np_0_1
 
 
@@ -511,7 +512,7 @@ def batch_inpaint_junctions(
             )
 
             # Clear cache between chunks
-            torch.cuda.empty_cache()
+            empty_cache(device)
 
         return full_volume_pt
 
@@ -612,7 +613,7 @@ def batch_inpaint_junctions(
     batch_generators = []
     for i in range(len(junction_infos)):
         junction_seed = seed + i * 1000
-        generator = torch.Generator(device=device).manual_seed(junction_seed)
+        generator = get_generator(device, junction_seed)
         batch_generators.append(generator)
 
     # Main batch inpainting process
@@ -622,7 +623,7 @@ def batch_inpaint_junctions(
         timesteps = inpainting_scheduler.timesteps
 
         # Create initial noise for entire batch
-        batch_latents = torch.randn(batch_image_slices.shape, device=device)
+        batch_latents = randn_compatible(batch_image_slices.shape, device)
 
         # Create masked images for entire batch
         batch_masked_images = batch_image_slices * (1.0 - batch_masks) - batch_masks
@@ -649,8 +650,8 @@ def batch_inpaint_junctions(
                 # RePaint-like guidance for batch
                 if i_step < len(timesteps) - 1:
                     prev_t = timesteps[i_step + 1]
-                    noise_for_gt_conditioning = torch.randn(
-                        batch_image_slices.shape, device=device, dtype=batch_image_slices.dtype
+                    noise_for_gt_conditioning = randn_compatible(
+                        batch_image_slices.shape, device, dtype=batch_image_slices.dtype
                     )
 
                     # Add noise to original images
@@ -705,7 +706,7 @@ def batch_inpaint_junctions(
 
     # Cleanup
     del batch_image_slices, batch_masks, batch_latents, batch_masked_images
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     return full_volume_pt
 
@@ -756,7 +757,7 @@ def generate_stitched_volume_with_inpainting(
         A NumPy array representing the final stitched volume [0, 1], or None if generation fails.
     """
     logger.info(f"Starting separate inpainting stitching: {n_blocks=}, {overlap=}, {seed=}")
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     # inital blocks
     sample_size = base_unet.config.sample_size
@@ -883,7 +884,7 @@ def generate_stitched_volume_with_inpainting(
         current_d += step
 
     full_volume_pt = full_volume_pt.to(device)
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     # inpainting seams using batch processing
     logger.info("Preparing junction information for batch inpainting")

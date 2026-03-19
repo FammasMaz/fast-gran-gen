@@ -117,7 +117,19 @@ class Upsample3D(nn.Module):
             # scale factor of 2 is used to match the downsampling block behavior
             output_size = (hidden_states.shape[2] * 2, hidden_states.shape[3] * 2, hidden_states.shape[4] * 2)
 
-        hidden_states = F.interpolate(hidden_states, size=output_size, mode="trilinear", align_corners=False)
+        # MPS does not implement any 3D upsample kernels (trilinear or nearest).
+        # Use repeat_interleave (basic tensor op, fully MPS-native) then slice
+        # to the exact target size.  On other backends keep the original
+        # trilinear path for best quality.
+        if hidden_states.device.type == "mps":
+            # repeat_interleave by 2 in each spatial dim, then trim to output_size
+            h = hidden_states
+            h = h.repeat_interleave(2, dim=2)
+            h = h.repeat_interleave(2, dim=3)
+            h = h.repeat_interleave(2, dim=4)
+            hidden_states = h[:, :, :output_size[0], :output_size[1], :output_size[2]]
+        else:
+            hidden_states = F.interpolate(hidden_states, size=output_size, mode="trilinear", align_corners=False)
 
         if self.use_conv:
             hidden_states = self.conv(hidden_states)

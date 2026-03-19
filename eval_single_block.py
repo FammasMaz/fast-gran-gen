@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from diffusers import DDPMScheduler, DDPMPipeline
 import os
 import sys
+from utils.device_utils import get_device, get_generator, manual_seed_all, get_torch_dtype, apply_low_memory_defaults
 
 # Add PyVista import for VTI saving
 try:
@@ -87,7 +88,7 @@ def generate_with_base_model(base_pipeline, device, inference_steps=1000, seed=4
     C = base_unet.config.in_channels  # Should be 1 for base model
 
     # Initialize noise
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = get_generator(device, seed)
     latents = torch.randn((1, C, D, H, W), generator=generator, device=device, dtype=base_unet.dtype)
 
     # Scale initial noise if needed
@@ -131,7 +132,7 @@ def inpaint_with_inpainting_model(inpainting_pipeline, original_latents, mask, d
     masked_images = original_latents * (1.0 - mask) - mask
 
     # Initialize noise for inpainting
-    generator = torch.Generator(device=device).manual_seed(seed + 1)  # Different seed for inpainting
+    generator = get_generator(device, seed + 1)  # Different seed for inpainting
     latents = torch.randn(original_latents.shape, generator=generator, device=device, dtype=original_latents.dtype)
 
     # Scale initial noise if needed
@@ -200,6 +201,12 @@ def main():
 
     # Output
     parser.add_argument("--output_dir", type=str, default="out/single_test/", help="Output directory for results")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"],
+                        help="Device to use for computation.")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float32", "float16"],
+                        help="Model precision. 'float16' halves memory usage.")
+    parser.add_argument("--low-memory", action="store_true", default=False,
+                        help="Enable low-memory optimisations (attention slicing).")
 
     args = parser.parse_args()
 
@@ -208,14 +215,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device(args.device)
     print(f"Using device: {device}")
 
     # Set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    manual_seed_all(device, args.seed)
 
     print("=== Single Test: Gap Filling ===")
     print(f"Base model: {args.base_model_path}")
@@ -224,15 +230,22 @@ def main():
     print(f"Output directory: {output_dir}")
 
     try:
+        torch_dtype = get_torch_dtype(args.dtype, device)
+        dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
+
         # Load base model
         print("Loading base model...")
-        base_pipeline = DDPMPipeline.from_pretrained(args.base_model_path)
+        base_pipeline = DDPMPipeline.from_pretrained(args.base_model_path, **dtype_kwargs)
         base_pipeline = base_pipeline.to(device)
+        if args.low_memory:
+            apply_low_memory_defaults(base_pipeline, device)
 
         # Load inpainting model
         print("Loading inpainting model...")
-        inpainting_pipeline = DDPMPipeline.from_pretrained(args.inpainting_model_path)
+        inpainting_pipeline = DDPMPipeline.from_pretrained(args.inpainting_model_path, **dtype_kwargs)
         inpainting_pipeline = inpainting_pipeline.to(device)
+        if args.low_memory:
+            apply_low_memory_defaults(inpainting_pipeline, device)
 
         # Verify inpainting model is configured correctly
         inpainting_unet = inpainting_pipeline.unet

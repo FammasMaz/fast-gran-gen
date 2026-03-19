@@ -12,6 +12,7 @@ from utils.eval_utils import (
     generate_cpu_overlapping_volume,
     generate_stitched_volume_with_inpainting,
 )
+from utils.device_utils import get_device, empty_cache, get_torch_dtype, apply_low_memory_defaults
 import pyvista as pv
 
 PYVISTA_AVAILABLE = True
@@ -148,7 +149,29 @@ def main():
         help="Value to threshold the final volume at (None = no thresholding) (used with 'separate_inpainting' mode)",
     )
 
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Device to use for computation. 'auto' selects the best available backend (CUDA > MPS > CPU).",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float32", "float16"],
+        help="Model precision. 'float16' halves memory usage. 'auto' keeps the model's saved precision.",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        default=False,
+        help="Enable low-memory optimisations (attention slicing). Recommended for Apple Silicon with limited RAM.",
+    )
+
     args = parser.parse_args()
+
 
     if args.seed is None:
         args.seed = int.from_bytes(os.urandom(8), "big")
@@ -168,14 +191,18 @@ def main():
             "Warning: '--inpainting_model_path' is provided but '--stitching_mode' is not 'separate_inpainting'. The inpainting model will not be used."
         )
 
-    torch.cuda.empty_cache()
+    empty_cache(args.device)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = str(get_device(args.device))
     print(f"Using device: {device}")
 
     print(f"Loading BASE diffusion pipeline from: {model_path}")
+    torch_dtype = get_torch_dtype(args.dtype, device)
+    dtype_kwargs = {"torch_dtype": torch_dtype} if torch_dtype is not None else {}
     try:
-        pipeline = DDPMPipeline.from_pretrained(model_path).to(device)
+        pipeline = DDPMPipeline.from_pretrained(model_path, **dtype_kwargs).to(device)
+        if args.low_memory:
+            apply_low_memory_defaults(pipeline, device)
         if args.scheduler_type == "ddim":
             pipeline.scheduler = DDIMScheduler.from_pretrained(model_path / "scheduler")
         unet = pipeline.unet
@@ -203,7 +230,9 @@ def main():
         inpainting_model_path = Path(args.inpainting_model_path)
         print(f"Loading INPAINTING diffusion pipeline from: {inpainting_model_path}")
         try:
-            inpainting_pipeline = DiffusionPipeline.from_pretrained(inpainting_model_path).to(device)
+            inpainting_pipeline = DiffusionPipeline.from_pretrained(inpainting_model_path, **dtype_kwargs).to(device)
+            if args.low_memory:
+                apply_low_memory_defaults(inpainting_pipeline, device)
 
             if hasattr(inpainting_pipeline, "unet"):
                 inpainting_unet = inpainting_pipeline.unet
@@ -322,7 +351,7 @@ def main():
                     current_seed += 1
                     if "full_vol_np" in locals() and full_vol_np is not None:
                         del full_vol_np
-                    torch.cuda.empty_cache()
+                    empty_cache(device)
                     if retries > args.max_retries:
                         print("Max retries reached for CPU simple mode.")
                         exit()
@@ -414,7 +443,7 @@ def main():
                                 print(f"  Clearing context GPU tensor ({(current_context_gpu_mem / 1024**2):.2f} MB)")
                                 del current_context_gpu
                                 current_context_gpu = None
-                        torch.cuda.empty_cache()
+                        empty_cache(device)
 
                     print("Stitching generated parts for sequential_latent mode...")
                     if not all_cpu_parts:
@@ -458,7 +487,7 @@ def main():
                     full_vol_np = None
                     full_vol_tensor = None
                     current_context_gpu = None
-                    torch.cuda.empty_cache()
+                    empty_cache(device)
                     if retries > args.max_retries:
                         print(f"Error: Max retries ({args.max_retries}) reached for sequential latent generation.")
                         exit()

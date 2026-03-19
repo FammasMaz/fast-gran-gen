@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import io
 from utils.telegram_notifier import notifier
+from utils.device_utils import get_mixed_precision, get_generator
 from pathlib import Path
 from scipy import ndimage
 import pyvista as pv
@@ -144,7 +145,7 @@ class Trainer:
         self.scheduler = SequentialLR(self.optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
 
         if self.args.accelerator:
-            mixed_precision = "fp16" if self.args.mixed_precision else None
+            mixed_precision = get_mixed_precision(self.device, self.args.mixed_precision)
             self.accelerator = Accelerator(mixed_precision=mixed_precision)
             # prepare the model, optimizer, train_loader, val_loader, scheduler for distributed training
             self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = self.accelerator.prepare(
@@ -931,7 +932,7 @@ class Trainer:
                         )
 
             # Initialize noise
-            generator = torch.Generator(device=self.device).manual_seed(self.args.seed + epoch)
+            generator = get_generator(self.device, self.args.seed + epoch)
             latents = torch.randn(image_shape, generator=generator, device=self.device)
 
             #  Initialize Sampler based on args
