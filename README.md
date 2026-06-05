@@ -1,6 +1,6 @@
 # Fast 3D Diffusion for Scalable Granular Media Synthesis
 
-This repository contains the official implementation of "Fast Granular Media Generation" as described in the associated NeurIPS paper.
+This repository contains the official implementation of "Fast Granular Media Generation".
 
 ## Overview
 
