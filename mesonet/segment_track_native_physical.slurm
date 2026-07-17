@@ -22,7 +22,7 @@ cd "$CODE"
 python polyhedron_segmentation.py \
   --input "$SOURCE/profiled_track.npy" \
   --output "$OUT/physical20.json" \
-  --voxel-spacing 0.003125 0.0046875 0.0046875 \
+  --voxel-spacing 0.003125 0.003125 0.003125 \
   --origin 0.0 -2.25 -2.10 \
   --method watershed_sdf \
   --marker-threshold-percentile 90 \
@@ -64,7 +64,7 @@ out = Path(sys.argv[2])
 profile = np.load(source / "profiled_track.npy", mmap_mode="r")
 payload = json.loads((out / "physical20.json").read_text())
 grains = payload["polyhedrons"]
-spacing = np.array([0.003125, 0.0046875, 0.0046875])
+spacing = np.array([0.003125, 0.003125, 0.003125])
 occupied_volume = float(np.count_nonzero(profile) * np.prod(spacing))
 mesh_volume = float(sum(abs(float(g.get("volume", 0.0))) for g in grains.values()))
 diameters = []

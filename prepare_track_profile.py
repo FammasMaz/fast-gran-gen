@@ -50,6 +50,12 @@ def parse_args():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--scale-factor", type=float, default=3.0)
+    parser.add_argument(
+        "--isotropic-voxel-size",
+        type=float,
+        default=None,
+        help="Use one physical voxel size on all axes (old LMGC90 grain-scale contract).",
+    )
     parser.add_argument("--depth", type=float, default=0.30)
     parser.add_argument("--base-width", type=float, default=4.50)
     parser.add_argument("--crest-width", type=float, default=3.60)
@@ -66,10 +72,19 @@ def main():
     source = np.load(args.input)
     if source.ndim != 3:
         raise ValueError(f"expected 3-D volume, got {source.shape}")
-    base_spacing = np.array(
-        [args.base_depth / 32.0, args.base_width_unit / 64.0, args.base_length_unit / 64.0]
-    )
-    final_spacing = base_spacing * args.scale_factor
+    if args.isotropic_voxel_size is not None:
+        if args.isotropic_voxel_size <= 0.0:
+            raise ValueError("isotropic voxel size must be positive")
+        final_spacing = np.full(3, args.isotropic_voxel_size)
+    else:
+        base_spacing = np.array(
+            [
+                args.base_depth / 32.0,
+                args.base_width_unit / 64.0,
+                args.base_length_unit / 64.0,
+            ]
+        )
+        final_spacing = base_spacing * args.scale_factor
     final_dimensions = np.array([args.depth, args.base_width, args.length])
     target_shape = np.rint(final_dimensions / final_spacing).astype(int)
     cropped = centered_crop(source, target_shape)
@@ -105,6 +120,7 @@ def main():
         "axis_order": ["depth_z", "cross_track_y", "along_track_x"],
         "voxel_spacing_depth_width_length_m": final_spacing.tolist(),
         "uniform_scale_factor": args.scale_factor,
+        "isotropic_voxel_size_m": args.isotropic_voxel_size,
         "dimensions_m": {
             "depth": args.depth,
             "base_width": args.base_width,

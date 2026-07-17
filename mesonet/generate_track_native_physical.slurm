@@ -44,6 +44,7 @@ python prepare_track_profile.py \
   --output "$OUT/profiled_track.npy" \
   --metadata "$OUT/PROFILE.json" \
   --scale-factor 1.0 \
+  --isotropic-voxel-size 0.003125 \
   --depth 0.30 \
   --base-width 4.50 \
   --crest-width 3.60 \
@@ -59,7 +60,7 @@ import numpy as np
 
 out = Path(sys.argv[1])
 profile = np.load(out / "profiled_track.npy", mmap_mode="r")
-expected_shape = (96, 960, 896)
+expected_shape = (96, 1440, 1344)
 if profile.shape != expected_shape:
     raise RuntimeError(f"profile shape {profile.shape} != {expected_shape}")
 occupied = int(np.count_nonzero(profile))
