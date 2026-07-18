@@ -18,14 +18,17 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def centered_crop(volume, target_shape):
+def centered_crop_or_pad(volume, target_shape):
+    """Center-crop oversized axes and zero-pad undersized axes."""
     slices = []
+    padding = []
     for current, target in zip(volume.shape, target_shape):
-        if target > current:
-            raise ValueError(f"target axis {target} exceeds generated axis {current}")
-        start = (current - target) // 2
-        slices.append(slice(start, start + target))
-    return volume[tuple(slices)]
+        cropped = min(current, target)
+        start = (current - cropped) // 2
+        slices.append(slice(start, start + cropped))
+        missing = target - cropped
+        padding.append((missing // 2, missing - missing // 2))
+    return np.pad(volume[tuple(slices)], padding, mode="constant")
 
 
 def build_profile_mask(shape, spacing, crest_width, base_width, length):
@@ -87,7 +90,7 @@ def main():
         final_spacing = base_spacing * args.scale_factor
     final_dimensions = np.array([args.depth, args.base_width, args.length])
     target_shape = np.rint(final_dimensions / final_spacing).astype(int)
-    cropped = centered_crop(source, target_shape)
+    cropped = centered_crop_or_pad(source, target_shape)
     mask = build_profile_mask(
         cropped.shape,
         final_spacing,

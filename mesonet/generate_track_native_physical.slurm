@@ -64,6 +64,11 @@ expected_shape = (96, 1440, 1344)
 if profile.shape != expected_shape:
     raise RuntimeError(f"profile shape {profile.shape} != {expected_shape}")
 occupied = int(np.count_nonzero(profile))
+source = np.load(out / "generated_prism.npy", mmap_mode="r")
+padded_axes = [
+    max(0, target - current)
+    for current, target in zip(source.shape, expected_shape)
+]
 if occupied < 5_000_000:
     raise RuntimeError(f"occupied voxel count too small: {occupied}")
 
@@ -79,7 +84,9 @@ record = {
     "job_id": out.name.removeprefix("generation_"),
     "scope": "native_physical_five_sleeper_ballast",
     "uniform_scale_factor": 1.0,
+    "generated_shape_depth_width_length": list(source.shape),
     "profile_shape_depth_width_length": list(profile.shape),
+    "zero_padding_voxels_depth_width_length": padded_axes,
     "occupied_voxels": occupied,
     "profile_sha256": sha256(out / "profiled_track.npy"),
     "profile_metadata_sha256": sha256(out / "PROFILE.json"),
