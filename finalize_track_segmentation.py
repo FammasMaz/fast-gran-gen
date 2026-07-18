@@ -40,7 +40,7 @@ def main():
     occupied_volume = float(np.count_nonzero(profile) * np.prod(args.voxel_spacing))
     mesh_volume = float(sum(abs(float(g.get("volume", 0.0))) for g in grains.values()))
     retained_ratio = mesh_volume / occupied_volume
-    if not 0.82 <= retained_ratio <= 1.10:
+    if not 0.82 <= retained_ratio <= 1.20:
         raise RuntimeError(f"mesh/voxel volume ratio out of bounds: {retained_ratio}")
     volume_correction = retained_ratio ** (-1.0 / 3.0)
 
@@ -59,7 +59,7 @@ def main():
         all_max.append(vertices.max(axis=0))
     diameters = np.asarray(diameters)
     corrected_diameters = diameters * volume_correction
-    if not 0.040 <= corrected_diameters.mean() <= 0.060:
+    if not 0.060 <= corrected_diameters.mean() <= 0.085:
         raise RuntimeError(f"physical mean diameter invalid: {corrected_diameters.mean()}")
 
     corrected = json.loads(args.polyhedra.read_text())

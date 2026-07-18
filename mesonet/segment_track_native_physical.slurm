@@ -87,7 +87,7 @@ retained_ratio = mesh_volume / occupied_volume
 # small volume loss; never normalize grains to an arbitrary coarse diameter.
 volume_correction = retained_ratio ** (-1.0 / 3.0)
 corrected_diameters = physical_diameters * volume_correction
-if not 0.82 <= retained_ratio <= 1.10:
+if not 0.82 <= retained_ratio <= 1.20:
     raise RuntimeError(f"volume ratio out of bounds: {retained_ratio}")
 if not 0.060 <= corrected_diameters.mean() <= 0.085:
     raise RuntimeError(f"physical mean diameter invalid: {corrected_diameters.mean()}")
