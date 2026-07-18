@@ -81,13 +81,16 @@ for key, grain in grains.items():
     all_min.append(vertices.min(axis=0))
     all_max.append(vertices.max(axis=0))
 diameters = np.asarray(diameters)
-scale_to_72mm = 0.072 / float(diameters.mean())
-physical_diameters = diameters * scale_to_72mm
+physical_diameters = diameters.copy()
 retained_ratio = mesh_volume / occupied_volume
-if not 0.90 <= retained_ratio <= 1.10:
+# Surface extraction systematically trims voxel stair-steps. Correct only that
+# small volume loss; never normalize grains to an arbitrary coarse diameter.
+volume_correction = retained_ratio ** (-1.0 / 3.0)
+corrected_diameters = physical_diameters * volume_correction
+if not 0.82 <= retained_ratio <= 1.10:
     raise RuntimeError(f"volume ratio out of bounds: {retained_ratio}")
-if not 0.070 <= physical_diameters.mean() <= 0.074:
-    raise RuntimeError(f"mean diameter invalid: {physical_diameters.mean()}")
+if not 0.040 <= corrected_diameters.mean() <= 0.060:
+    raise RuntimeError(f"physical mean diameter invalid: {corrected_diameters.mean()}")
 if len(grains) < 50_000:
     raise RuntimeError(f"particle count too small: {len(grains)}")
 
@@ -107,9 +110,10 @@ record = {
     "occupied_voxel_volume_m3": occupied_volume,
     "mesh_volume_m3": mesh_volume,
     "mesh_to_voxel_volume_ratio": retained_ratio,
-    "raw_mean_diameter_m": float(diameters.mean()),
-    "lmgc90_scale_to_mean_diameter_0p072": scale_to_72mm,
-    "diameter_m_quantiles_after_scale": np.quantile(physical_diameters, [0.0, 0.05, 0.5, 0.95, 1.0]).tolist(),
+    "raw_mean_diameter_m": float(physical_diameters.mean()),
+    "lmgc90_volume_correction_scale": volume_correction,
+    "corrected_mean_diameter_m": float(corrected_diameters.mean()),
+    "diameter_m_quantiles_after_volume_correction": np.quantile(corrected_diameters, [0.0, 0.05, 0.5, 0.95, 1.0]).tolist(),
     "median_vertices": float(np.median(vertices_per_grain)),
     "source_axis_bounds_m": {
         "minimum": np.min(np.asarray(all_min), axis=0).tolist(),
