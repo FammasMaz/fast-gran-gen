@@ -22,7 +22,7 @@ cd "$CODE"
 python polyhedron_segmentation.py \
   --input "$SOURCE/profiled_track.npy" \
   --output "$OUT/physical20.json" \
-  --voxel-spacing 0.003125 0.003125 0.003125 \
+  --voxel-spacing 0.003125 0.0046875 0.0046875 \
   --origin 0.0 -2.25 -2.10 \
   --method watershed_sdf \
   --marker-threshold-percentile 90 \
@@ -64,7 +64,7 @@ out = Path(sys.argv[2])
 profile = np.load(source / "profiled_track.npy", mmap_mode="r")
 payload = json.loads((out / "physical20.json").read_text())
 grains = payload["polyhedrons"]
-spacing = np.array([0.003125, 0.003125, 0.003125])
+spacing = np.array([0.003125, 0.0046875, 0.0046875])
 occupied_volume = float(np.count_nonzero(profile) * np.prod(spacing))
 mesh_volume = float(sum(abs(float(g.get("volume", 0.0))) for g in grains.values()))
 diameters = []
@@ -89,7 +89,7 @@ volume_correction = retained_ratio ** (-1.0 / 3.0)
 corrected_diameters = physical_diameters * volume_correction
 if not 0.82 <= retained_ratio <= 1.10:
     raise RuntimeError(f"volume ratio out of bounds: {retained_ratio}")
-if not 0.040 <= corrected_diameters.mean() <= 0.060:
+if not 0.060 <= corrected_diameters.mean() <= 0.085:
     raise RuntimeError(f"physical mean diameter invalid: {corrected_diameters.mean()}")
 if len(grains) < 50_000:
     raise RuntimeError(f"particle count too small: {len(grains)}")

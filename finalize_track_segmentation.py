@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--polyhedra", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--marker", type=Path, required=True)
-    parser.add_argument("--voxel-size", type=float, default=0.003125)
+    parser.add_argument("--voxel-spacing", type=float, nargs=3, default=(0.003125, 0.0046875, 0.0046875))
     parser.add_argument("--minimum-particles", type=int, default=50_000)
     return parser.parse_args()
 
@@ -37,7 +37,7 @@ def main():
     if len(grains) < args.minimum_particles:
         raise RuntimeError(f"particle count too small: {len(grains)}")
 
-    occupied_volume = float(np.count_nonzero(profile) * args.voxel_size**3)
+    occupied_volume = float(np.count_nonzero(profile) * np.prod(args.voxel_spacing))
     mesh_volume = float(sum(abs(float(g.get("volume", 0.0))) for g in grains.values()))
     retained_ratio = mesh_volume / occupied_volume
     if not 0.82 <= retained_ratio <= 1.10:
