@@ -1,0 +1,35 @@
+{
+  "schema": "track_realization_seed_manifest_v1",
+  "campaign": "affine_v3_independent_track_pilot_20260819",
+  "historical_reference": {
+    "seed": 25100,
+    "profile_sha256": "80f075bf2aacf5c62a2c5c22e50a29a66ef414ff7c337ec3169fe07ec9fe5e57",
+    "polyhedra_sha256": "48bbb49102654981829fee285415d315a2d7a62d3f1abd830565197fd41fad08",
+    "copernicus_track_job_id": "9721116"
+  },
+  "seeds": [25101, 25102, 25103],
+  "geometry_m": {
+    "depth": 0.30,
+    "base_width": 4.50,
+    "crest_width": 3.60,
+    "length": 4.20
+  },
+  "generation": {
+    "inference_steps": 50,
+    "scheduler_type": "ddim",
+    "batch_size": 5,
+    "strip_batch_size": 5,
+    "inpaint_batch_size": 5
+  },
+  "segmentation_profile": "moderate20_physical_v1",
+  "model_files": {
+    "base/model_index.json": "01294843ede21fe5195b7fffc22f1d4fc52cc56d4a29aaa6f34f44cb4b6b650e",
+    "base/scheduler/scheduler_config.json": "79fd9fb217b4e9e77f7c269073bc04860a8c02b1621ded3f61f3543b12e56c8f",
+    "base/unet/config.json": "eccf2e6686e9d33358d0c835f0cd45d574eb83c5ad405f0168e288af1328d5fe",
+    "base/unet/diffusion_pytorch_model.safetensors": "d28baff0ce5493a5bcecdda064b5cb24b9a40dce208d78fdc8a6329913bcd988",
+    "inpainting/model_index.json": "01294843ede21fe5195b7fffc22f1d4fc52cc56d4a29aaa6f34f44cb4b6b650e",
+    "inpainting/scheduler/scheduler_config.json": "61123d24561ce49c9ca8d934348748f8e4410c844e9feeb0e7655ef2f7acbfdc",
+    "inpainting/unet/config.json": "30ccc2b26ec881bd8f515033194b4e507542feb7609d0ff20cf405050e9e12d0",
+    "inpainting/unet/diffusion_pytorch_model.safetensors": "237c470ac6484947c63267fd2657d0ca1646ada76e5b28c3a225c35da809f63b"
+  }
+}
